@@ -1,0 +1,13 @@
+node_modules/
+.env
+.env.*
+uploads/
+logs/
+file-index.json
+file-index.json*
+certs/
+*.key
+*.pem
+*.csr
+*.log
+.DS_Store

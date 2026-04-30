@@ -1,0 +1,26 @@
+{
+  "name": "tuchuang-file-hosting",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "test": "node --test tests/*.test.js",
+    "preview": "vite preview",
+    "server": "node server.js",
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.21.0",
+    "mime-types": "^2.1.35",
+    "multer": "^1.4.5-lts.1"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.3.4",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "vite": "^6.0.0"
+  }
+}
