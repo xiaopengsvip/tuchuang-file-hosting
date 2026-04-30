@@ -35,6 +35,8 @@ import {
 import { getPreviewKind } from './src/previewPolicy.js';
 import { createUploadLogger, errorMessage, buildSimpleUploadAccessEvent } from './src/uploadLogger.js';
 import { createIpRateLimiter } from './src/rateLimit.js';
+import { createContentDb } from './src/contentDb.js';
+import { applyUploadFeedPreference, isFeedPreferenceRequested } from './src/feedPolicy.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -58,6 +60,7 @@ const RESUMABLE_CHUNK_SIZE = Number(process.env.RESUMABLE_CHUNK_SIZE || DEFAULT_
 const RESUMABLE_CHUNK_MB = Math.ceil(RESUMABLE_CHUNK_SIZE / 1024 / 1024) + 1;
 const CHUNK_DIR = process.env.CHUNK_DIR || path.join(UPLOAD_DIR, '.chunks');
 const LOG_DIR = process.env.LOG_DIR || path.join(__dirname, 'logs');
+const DB_FILE = process.env.DB_FILE || path.join(__dirname, 'data', 'tuchuang.sqlite');
 
 fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 fs.mkdirSync(CHUNK_DIR, { recursive: true });
@@ -122,6 +125,14 @@ function getUploadLimit(req) {
     publicMaxFileMB: PUBLIC_UPLOAD_MAX_FILE_MB,
     adminMaxFileMB: ADMIN_UPLOAD_MAX_FILE_MB
   };
+}
+
+function uploadFeedRequested(input = {}) {
+  return isFeedPreferenceRequested(input.feedPreference ?? input.allowFeed ?? input.allow_feed ?? input.requestFeed);
+}
+
+function applyUploadFeedFields(record, { requested = false, isAdmin = false } = {}) {
+  return applyUploadFeedPreference(record, { requested, isAdmin });
 }
 
 function addSecurityHeaders(req, res, next) {
@@ -218,7 +229,7 @@ function cleanupChunkSessions(now = Date.now()) {
 }
 
 function getRecordById(id) {
-  return Object.values(fileIndex).find(f => f.id === id || f.filename === id);
+  return Object.values(fileIndex).find(f => f.id === id || f.filename === id) || contentDb.getFileById(id);
 }
 
 function publicRecord(record, req) {
@@ -281,9 +292,31 @@ if (nameMigration.changed > 0) {
   console.log(`[Tuchuang] Normalized ${nameMigration.changed} filename(s)`);
 }
 
+const contentDb = createContentDb({ filename: DB_FILE });
+const dbImport = contentDb.importFileIndex(fileIndex);
+if (dbImport.inserted > 0 || dbImport.updated > 0) {
+  console.log(`[Tuchuang] Metadata DB synced: ${dbImport.inserted} inserted, ${dbImport.updated} updated`);
+}
+
+function syncRecordToDb(record) {
+  if (!record) return null;
+  return contentDb.upsertFile(record);
+}
+
+function syncRecordToIndex(record) {
+  if (!record) return null;
+  const key = record.filename || record.storedName || record.id;
+  fileIndex[key] = { ...fileIndex[key], ...record };
+  return fileIndex[key];
+}
+
 function runExpiryCleanup(reason = 'scheduled') {
+  const before = new Map(Object.entries(fileIndex).map(([key, record]) => [key, record?.id || record?.filename || key]));
   const result = cleanupExpiredRecords({ fileIndex, uploadDir: UPLOAD_DIR });
   if (result.deleted > 0) {
+    for (const [key, id] of before.entries()) {
+      if (!fileIndex[key]) contentDb.deleteFile(id);
+    }
     saveIndex();
     console.log(`[Tuchuang] Deleted ${result.deleted} expired file(s) (${reason})`);
   }
@@ -411,6 +444,8 @@ app.post('/api/uploads/init', (req, res) => {
   });
   manifest.uploadTier = limit.tier;
   manifest.maxFileMB = limit.maxFileMB;
+  manifest.feedRequested = uploadFeedRequested(req.body || {});
+  manifest.feedRequestedByAdmin = limit.tier === 'admin';
 
   const existing = readManifest(manifest.uploadId);
   if (existing?.complete && existing.file) {
@@ -421,7 +456,13 @@ app.post('/api/uploads/init', (req, res) => {
     }
     removeChunkSession(existing.uploadId);
   }
-  const active = existing && !existing.complete ? { ...existing, uploadTier: existing.uploadTier || limit.tier, maxFileMB: existing.maxFileMB || limit.maxFileMB } : manifest;
+  const active = existing && !existing.complete ? {
+    ...existing,
+    uploadTier: existing.uploadTier || limit.tier,
+    maxFileMB: existing.maxFileMB || limit.maxFileMB,
+    feedRequested: existing.feedRequested || manifest.feedRequested,
+    feedRequestedByAdmin: existing.feedRequestedByAdmin || manifest.feedRequestedByAdmin
+  } : manifest;
   writeManifest(active);
   res.json({ success: true, ...getUploadStatus(active) });
 });
@@ -476,7 +517,7 @@ app.post('/api/uploads/:uploadId/complete', (req, res) => {
     fs.closeSync(fd);
   }
 
-  const record = buildFileRecord({
+  let record = buildFileRecord({
     id,
     originalName: manifest.originalName,
     filename: storedName,
@@ -486,7 +527,12 @@ app.post('/api/uploads/:uploadId/complete', (req, res) => {
     uploaderIp: req.ip
   });
   record.uploadTier = manifest.uploadTier || 'public';
+  record = applyUploadFeedFields(record, {
+    requested: manifest.feedRequested,
+    isAdmin: Boolean(manifest.feedRequestedByAdmin || record.uploadTier === 'admin')
+  });
   fileIndex[storedName] = record;
+  syncRecordToDb(record);
   saveIndex();
 
   manifest.complete = true;
@@ -503,10 +549,11 @@ app.post('/api/upload', markSimpleUploadStart, uploadArrayForRequest, (req, res)
   }
 
   const limit = req.uploadLimit || getUploadLimit(req);
+  const feedRequested = uploadFeedRequested(req.body || {});
   const results = req.files.map(file => {
     const id = path.basename(file.filename, path.extname(file.filename));
     const originalName = normalizeOriginalName(file.originalname || file.filename);
-    const record = buildFileRecord({
+    let record = buildFileRecord({
       id,
       originalName,
       filename: file.filename,
@@ -516,7 +563,9 @@ app.post('/api/upload', markSimpleUploadStart, uploadArrayForRequest, (req, res)
       uploaderIp: req.ip
     });
     record.uploadTier = limit.tier;
+    record = applyUploadFeedFields(record, { requested: feedRequested, isAdmin: limit.tier === 'admin' });
     fileIndex[file.filename] = record;
+    syncRecordToDb(record);
     return publicRecord(record, req);
   });
 
@@ -530,48 +579,78 @@ app.get('/api/files', (req, res) => {
   const limit = Math.min(Math.max(parseInt(req.query.limit) || 50, 1), 200);
   const search = String(req.query.search || '').toLowerCase();
   const typeFilter = String(req.query.type || '');
+  const result = contentDb.listFiles({ page, limit, search, type: typeFilter });
+  res.json({
+    success: true,
+    files: result.files.map(file => publicRecord(file, req)),
+    pagination: result.pagination
+  });
+});
 
-  let files = Object.values(fileIndex).map(f => publicRecord(f, req));
-  if (search) files = files.filter(f => (f.originalName || '').toLowerCase().includes(search) || f.id.includes(search));
-  if (typeFilter) {
-    files = files.filter(f => {
-      const mt = f.mimeType || '';
-      switch (typeFilter) {
-        case 'image': return mt.startsWith('image/');
-        case 'video': return mt.startsWith('video/');
-        case 'audio': return mt.startsWith('audio/');
-        case 'document': return mt.includes('pdf') || mt.includes('document') || mt.includes('text') || mt.includes('sheet') || mt.includes('presentation');
-        case 'other': return !mt.startsWith('image/') && !mt.startsWith('video/') && !mt.startsWith('audio/') && !mt.includes('pdf') && !mt.includes('text');
-        default: return true;
-      }
-    });
+app.get('/api/feed/videos', (req, res) => {
+  const result = contentDb.listFeedVideos({ limit: req.query.limit || 10, cursor: req.query.cursor || '' });
+  res.json({
+    success: true,
+    videos: result.videos.map(file => publicRecord(file, req)),
+    nextCursor: result.nextCursor
+  });
+});
+
+app.patch('/api/files/:id/feed', requireAdmin, (req, res) => {
+  const existing = contentDb.getFileById(req.params.id);
+  if (!existing) return res.status(404).json({ success: false, error: 'File not found' });
+  const wantsFeed = req.body?.allowFeed === true || req.body?.allowFeed === 'true';
+  if (wantsFeed && existing.mediaType !== 'video') {
+    return res.status(400).json({ success: false, error: 'Only video files can enter feed' });
   }
+  const updated = contentDb.updateFeedSettings(existing.id, {
+    visibility: req.body?.visibility,
+    allowFeed: req.body?.allowFeed,
+    feedStatus: req.body?.feedStatus,
+    title: req.body?.title,
+    description: req.body?.description,
+    tags: req.body?.tags,
+  });
+  if (!updated) return res.status(404).json({ success: false, error: 'File not found' });
+  syncRecordToIndex(updated);
+  saveIndex();
+  res.json({ success: true, file: publicRecord(updated, req) });
+});
 
-  files.sort((a, b) => new Date(b.uploadTime) - new Date(a.uploadTime));
-  const total = files.length;
-  const totalPages = Math.max(Math.ceil(total / limit), 1);
-  const start = (page - 1) * limit;
-  res.json({ success: true, files: files.slice(start, start + limit), pagination: { page, limit, total, totalPages } });
+app.get('/api/notes', (req, res) => {
+  const includePrivate = isAuthed(req);
+  const result = contentDb.listNotes({ fileId: req.query.fileId || '', includePrivate, limit: req.query.limit || 50 });
+  res.json({ success: true, notes: result.notes });
+});
+
+app.post('/api/notes', requireAdmin, (req, res) => {
+  const fileId = String(req.body?.fileId || '');
+  if (fileId && !contentDb.getFileById(fileId)) return res.status(404).json({ success: false, error: 'File not found' });
+  const note = contentDb.createNote({
+    fileId,
+    title: req.body?.title || '',
+    content: req.body?.content || '',
+    contentFormat: req.body?.contentFormat || 'markdown',
+    visibility: req.body?.visibility || 'private',
+    pinned: req.body?.pinned === true,
+    tags: req.body?.tags || [],
+  });
+  res.json({ success: true, note });
+});
+
+app.delete('/api/notes/:id', requireAdmin, (req, res) => {
+  const deleted = contentDb.deleteNote(req.params.id);
+  if (!deleted) return res.status(404).json({ success: false, error: 'Note not found' });
+  res.json({ success: true });
 });
 
 app.get('/api/stats', (req, res) => {
-  const files = Object.values(fileIndex);
-  const totalSize = files.reduce((sum, f) => sum + (f.size || 0), 0);
-  const totalAccessCount = files.reduce((sum, f) => sum + (Number(f.accessCount) || 0), 0);
-  const imageCount = files.filter(f => (f.mimeType || '').startsWith('image/')).length;
-  const videoCount = files.filter(f => (f.mimeType || '').startsWith('video/')).length;
-  const audioCount = files.filter(f => (f.mimeType || '').startsWith('audio/')).length;
+  const dbStats = contentDb.stats();
   const limit = getUploadLimit(req);
   res.json({
     success: true,
     stats: {
-      totalFiles: files.length,
-      totalSize,
-      totalAccessCount,
-      imageCount,
-      videoCount,
-      audioCount,
-      otherCount: files.length - imageCount - videoCount - audioCount,
+      ...dbStats,
       uploadTier: limit.tier,
       maxFileMB: limit.maxFileMB,
       maxFileGB: limit.maxFileGB,
@@ -592,6 +671,7 @@ app.delete('/api/files/:id', requireAdmin, (req, res) => {
   const storedName = safeName(record.storedName || record.filename);
   const filePath = path.join(UPLOAD_DIR, storedName);
   delete fileIndex[record.filename || storedName];
+  contentDb.deleteFile(record.id || id);
   saveIndex();
   if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
   res.json({ success: true });
@@ -630,6 +710,7 @@ function sendFileRecord(req, res, requestedDisposition = 'inline') {
 
   if (shouldRefreshAccess) {
     touchRecord(record);
+    syncRecordToDb(record);
     saveIndex();
   }
 
@@ -675,6 +756,7 @@ app.get('/preview/:id', (req, res) => {
   if (!fs.existsSync(filePath)) return res.status(404).send('File missing');
 
   touchRecord(record);
+  syncRecordToDb(record);
   saveIndex();
 
   const file = publicRecord(record, req);

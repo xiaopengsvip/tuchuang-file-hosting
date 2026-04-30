@@ -1,13 +1,9 @@
 node_modules/
+.DS_Store
 .env
-.env.*
+certs/
 uploads/
 logs/
+data/
 file-index.json
-file-index.json*
-certs/
-*.key
-*.pem
-*.csr
-*.log
-.DS_Store
+file-index.json.bak*

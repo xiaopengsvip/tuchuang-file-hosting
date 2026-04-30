@@ -11,6 +11,9 @@ export function routeRequiresAdmin(method = 'GET', url = '/') {
   const pathname = normalizePathname(url);
 
   if (normalizedMethod === 'DELETE' && pathname.startsWith('/api/files/')) return true;
+  if (normalizedMethod === 'PATCH' && /^\/api\/files\/[^/]+\/feed$/.test(pathname)) return true;
+  if (normalizedMethod === 'POST' && pathname === '/api/notes') return true;
+  if (normalizedMethod === 'DELETE' && pathname.startsWith('/api/notes/')) return true;
   return false;
 }
 

@@ -2,6 +2,7 @@ import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { getClipboardUploadFiles, mergeUploadedResults, isPreviewableImage, buildFileFingerprint, shouldUseResumableUpload, getFileChunks } from './uploadHelpers.js';
 import { getFriendlyUploadError, getDirectViewUrl, getSameSitePreviewUrl } from './uploadUi.js';
 import { getPreviewKind, buildPreviewUrl } from './previewPolicy.js';
+import { buildFeedSettingsPayload, getFeedBadge, normalizeNoteDraft, isVideoFile, buildUploadFeedPreference } from './contentPlatformUi.js';
 
 const API_BASE = '';
 const DEFAULT_MAX_FILE_MB = 1024;
@@ -278,6 +279,7 @@ function UploadResults({ files, onCopy, onClear, onOpenSiteView, onOpenDirectVie
                   <span>过期 {formatDateTime(file.expiresAt)}</span>
                 </div>
                 <FileLifecycleMeta file={file} compact />
+                {isVideoFile(file) && <div className={`feed-status-pill ${file.allowFeed && file.feedStatus === 'approved' ? 'active' : ''}`}>🎬 {getFeedBadge(file)}</div>}
                 <div className="link-row">
                   <input className="link-input" readOnly value={link || ''} onFocus={e => e.target.select()} />
                   <button className="btn btn-copy" onClick={() => onCopy(link)}>复制链接</button>
@@ -298,6 +300,89 @@ function UploadResults({ files, onCopy, onClear, onOpenSiteView, onOpenDirectVie
   );
 }
 
+function FeedSection({ videos, loading, onRefresh, onOpenSiteView, onOpenDirectView }) {
+  return (
+    <section className="content-panel glass feed-panel">
+      <div className="panel-header">
+        <div>
+          <div className="section-title">🎬 视频推荐区</div>
+          <div className="section-subtitle">只展示已明确允许进入推荐区的视频；默认上传不会自动公开到这里。</div>
+        </div>
+        <button className="btn btn-open" onClick={onRefresh} disabled={loading}>{loading ? '刷新中...' : '刷新推荐'}</button>
+      </div>
+      {loading ? <div className="empty-state compact"><div className="loading-spinner" /><div className="empty-text">加载视频推荐...</div></div> : null}
+      {!loading && !videos.length ? (
+        <div className="empty-state compact">
+          <div className="empty-icon">🎞️</div>
+          <div className="empty-text">暂无推荐视频</div>
+          <div style={{ color: 'var(--text-dim)', fontSize: 14 }}>管理员可在视频文件卡片中点击“进推荐”后出现在这里。</div>
+        </div>
+      ) : null}
+      {!loading && videos.length > 0 ? (
+        <div className="feed-reel">
+          {videos.map(video => {
+            const source = buildPreviewUrl(video) || video.url;
+            return (
+              <article key={video.id} className="feed-card">
+                <video className="feed-video" src={source} controls playsInline preload="metadata" />
+                <div className="feed-card-info">
+                  <div className="feed-title">{video.title || video.originalName}</div>
+                  <div className="feed-meta">{formatSize(video.size || 0)} · {accessCountText(video)} · {formatDate(video.uploadTime)}</div>
+                  {video.description ? <div className="feed-desc">{video.description}</div> : null}
+                  {Array.isArray(video.tags) && video.tags.length ? <div className="feed-tags">{video.tags.map(tag => <span key={tag}>{tag}</span>)}</div> : null}
+                  <div className="feed-actions">
+                    <button className="btn btn-open" onClick={() => onOpenSiteView(video)}>👁 详情预览</button>
+                    <button className="btn btn-copy" onClick={() => onOpenDirectView(video)}>↗ 原文件</button>
+                  </div>
+                </div>
+              </article>
+            );
+          })}
+        </div>
+      ) : null}
+    </section>
+  );
+}
+
+function NotesSection({ notes, loading, adminMode, noteDraft, setNoteDraft, onCreateNote, onRefresh }) {
+  return (
+    <section className="content-panel glass notes-panel">
+      <div className="panel-header">
+        <div>
+          <div className="section-title">📝 笔记</div>
+          <div className="section-subtitle">MVP 支持公开/私有 Markdown 笔记；发布和查看私有笔记需要管理员 Token。</div>
+        </div>
+        <button className="btn btn-open" onClick={onRefresh} disabled={loading}>{loading ? '刷新中...' : '刷新笔记'}</button>
+      </div>
+      {adminMode ? (
+        <div className="note-editor">
+          <input className="settings-input" placeholder="笔记标题" value={noteDraft.title} onChange={e => setNoteDraft(prev => ({ ...prev, title: e.target.value }))} />
+          <textarea className="settings-input note-textarea" placeholder="写一点说明、剪辑想法或文件备注，支持 Markdown" value={noteDraft.content} onChange={e => setNoteDraft(prev => ({ ...prev, content: e.target.value }))} />
+          <input className="settings-input" placeholder="标签，用英文逗号分隔" value={noteDraft.tagsText} onChange={e => setNoteDraft(prev => ({ ...prev, tagsText: e.target.value }))} />
+          <label className="note-public-toggle"><input type="checkbox" checked={noteDraft.publicNote} onChange={e => setNoteDraft(prev => ({ ...prev, publicNote: e.target.checked }))} /> 公开展示</label>
+          <button className="btn btn-copy" onClick={onCreateNote}>发布笔记</button>
+        </div>
+      ) : (
+        <div className="settings-log-empty">保存管理员 Token 后可以创建私有/公开笔记。</div>
+      )}
+      {loading ? <div className="empty-state compact"><div className="loading-spinner" /><div className="empty-text">加载笔记...</div></div> : null}
+      {!loading && !notes.length ? <div className="empty-state compact"><div className="empty-icon">📒</div><div className="empty-text">暂无笔记</div></div> : null}
+      {!loading && notes.length ? (
+        <div className="note-list">
+          {notes.map(note => (
+            <article key={note.id} className="note-card">
+              <div className="note-card-top"><strong>{note.title || '未命名笔记'}</strong><span>{note.visibility === 'public' ? '公开' : '私有'}</span></div>
+              <p>{note.content}</p>
+              {Array.isArray(note.tags) && note.tags.length ? <div className="feed-tags">{note.tags.map(tag => <span key={tag}>{tag}</span>)}</div> : null}
+              <div className="feed-meta">{formatDate(note.createdAt)}</div>
+            </article>
+          ))}
+        </div>
+      ) : null}
+    </section>
+  );
+}
+
 export default function App() {
   const [files, setFiles] = useState([]);
   const [stats, setStats] = useState({ totalFiles: 0, totalSize: 0, totalAccessCount: 0, imageCount: 0, videoCount: 0, otherCount: 0, maxFileMB: DEFAULT_MAX_FILE_MB, expireAfterIdleDays: DEFAULT_EXPIRE_AFTER_IDLE_DAYS, uploadTier: 'public' });
@@ -311,6 +396,7 @@ export default function App() {
   const [uploadProgress, setUploadProgress] = useState(0);
   const [uploadStatusText, setUploadStatusText] = useState('');
   const [uploadError, setUploadError] = useState(null);
+  const [uploadFeedRequested, setUploadFeedRequested] = useState(false);
   const [toasts, setToasts] = useState([]);
   const [uploadResults, setUploadResults] = useState([]);
   const [previewFile, setPreviewFile] = useState(null);
@@ -322,6 +408,12 @@ export default function App() {
   const [logsLoading, setLogsLoading] = useState(false);
   const [logsError, setLogsError] = useState('');
   const [needToken, setNeedToken] = useState(false);
+  const [activeView, setActiveView] = useState('files');
+  const [feedVideos, setFeedVideos] = useState([]);
+  const [feedLoading, setFeedLoading] = useState(false);
+  const [notes, setNotes] = useState([]);
+  const [notesLoading, setNotesLoading] = useState(false);
+  const [noteDraft, setNoteDraft] = useState({ title: '', content: '', tagsText: '', publicNote: false });
   const fileInputRef = useRef(null);
   const searchTimerRef = useRef(null);
   const maxFileMB = publicConfig.maxFileMB || stats.maxFileMB || DEFAULT_MAX_FILE_MB;
@@ -408,6 +500,32 @@ export default function App() {
     } catch (e) {}
   }, [authHeaders]);
 
+  const fetchFeedVideos = useCallback(async () => {
+    setFeedLoading(true);
+    try {
+      const res = await fetch(`${API_BASE}/api/feed/videos?limit=20`);
+      const data = await res.json().catch(() => ({}));
+      if (data.success) setFeedVideos(Array.isArray(data.videos) ? data.videos : []);
+    } catch (e) {
+      addToast('加载视频推荐失败', 'error');
+    } finally {
+      setFeedLoading(false);
+    }
+  }, [addToast]);
+
+  const fetchNotes = useCallback(async () => {
+    setNotesLoading(true);
+    try {
+      const res = await fetch(`${API_BASE}/api/notes?limit=80`, { headers: authHeaders() });
+      const data = await res.json().catch(() => ({}));
+      if (data.success) setNotes(Array.isArray(data.notes) ? data.notes : []);
+    } catch (e) {
+      addToast('加载笔记失败', 'error');
+    } finally {
+      setNotesLoading(false);
+    }
+  }, [authHeaders, addToast]);
+
   const refreshFileRecord = useCallback(async (fileId) => {
     if (!fileId) return;
     try {
@@ -456,6 +574,10 @@ export default function App() {
   useEffect(() => { fetchFiles(); }, [fetchFiles]);
   useEffect(() => { fetchStats(); }, [fetchStats]);
   useEffect(() => {
+    if (activeView === 'feed') fetchFeedVideos();
+    if (activeView === 'notes') fetchNotes();
+  }, [activeView, fetchFeedVideos, fetchNotes]);
+  useEffect(() => {
     if (settingsOpen && adminToken) fetchUploadLogs();
   }, [settingsOpen, adminToken, fetchUploadLogs]);
 
@@ -470,6 +592,7 @@ export default function App() {
   const handleUpload = useCallback(async (fileList) => {
     if (!fileList || fileList.length === 0) return;
     const selectedFiles = Array.from(fileList);
+    const uploadFeedPreference = buildUploadFeedPreference(uploadFeedRequested);
     const oversized = selectedFiles.filter(file => file.size > maxFileBytes);
     if (oversized.length > 0) {
       addToast(`单文件最大 ${formatSize(maxFileBytes)}，超限：${oversized[0].name}`, 'error');
@@ -536,6 +659,7 @@ export default function App() {
       xhr.onerror = () => reject(new Error('Network error'));
       const formData = new FormData();
       for (const file of batchFiles) formData.append('files', file);
+      if (uploadFeedPreference) formData.append('feedPreference', uploadFeedPreference);
       xhr.open('POST', `${API_BASE}/api/upload`);
       if (adminToken) xhr.setRequestHeader('X-Admin-Token', adminToken);
       xhr.send(formData);
@@ -580,7 +704,8 @@ export default function App() {
           mimeType: file.type || 'application/octet-stream',
           lastModified: file.lastModified || 0,
           fingerprint: buildFileFingerprint(file),
-          chunkSize
+          chunkSize,
+          feedPreference: uploadFeedPreference
         });
 
         if (init.file) {
@@ -642,7 +767,7 @@ export default function App() {
       setUploadProgress(0);
       setUploadStatusText('');
     }
-  }, [addToast, adminToken, authHeaders, fetchFiles, fetchStats, friendlyUploadError, maxFileBytes, publicConfig.resumableChunkSize, publicConfig.resumableUpload, reportUploadFailure, uploadProgress]);
+  }, [addToast, adminToken, authHeaders, fetchFiles, fetchStats, friendlyUploadError, maxFileBytes, publicConfig.resumableChunkSize, publicConfig.resumableUpload, reportUploadFailure, uploadFeedRequested, uploadProgress]);
 
   useEffect(() => {
     const onPaste = (event) => {
@@ -717,8 +842,77 @@ export default function App() {
       addToast('文件已删除', 'info');
       fetchFiles();
       fetchStats();
+      if (activeView === 'feed') fetchFeedVideos();
     } catch (e) {
       addToast('删除失败', 'error');
+    }
+  };
+
+  const handleToggleFeed = async (file, enable) => {
+    if (!adminToken) {
+      setNeedToken(true);
+      addToast('保存管理员 Token 后才能调整推荐区', 'error');
+      return;
+    }
+    if (enable && !isVideoFile(file)) {
+      addToast('只有视频文件能进入推荐区', 'error');
+      return;
+    }
+    try {
+      const payload = buildFeedSettingsPayload(file, enable);
+      const res = await fetch(`${API_BASE}/api/files/${encodeURIComponent(file.id)}/feed`, {
+        method: 'PATCH',
+        headers: authHeaders({ 'Content-Type': 'application/json' }),
+        body: JSON.stringify(payload)
+      });
+      const data = await res.json().catch(() => ({}));
+      if (res.status === 401) {
+        setNeedToken(true);
+        addToast('管理员 Token 无效，无法调整推荐区', 'error');
+        return;
+      }
+      if (!res.ok || data.success === false) throw new Error(data.error || `HTTP ${res.status}`);
+      const updated = data.file;
+      setFiles(prev => prev.map(item => (item.id === updated.id ? { ...item, ...updated } : item)));
+      setUploadResults(prev => prev.map(item => (item.id === updated.id ? { ...item, ...updated } : item)));
+      setPreviewFile(prev => (prev && prev.id === updated.id ? { ...prev, ...updated } : prev));
+      addToast(enable ? '已允许该视频进入推荐区' : '已从推荐区隐藏', 'success');
+      fetchStats();
+      fetchFeedVideos();
+    } catch (e) {
+      addToast(`推荐区更新失败：${e.message || e}`, 'error');
+    }
+  };
+
+  const handleCreateNote = async () => {
+    if (!adminToken) {
+      setNeedToken(true);
+      addToast('保存管理员 Token 后才能发布笔记', 'error');
+      return;
+    }
+    const payload = normalizeNoteDraft(noteDraft);
+    if (!payload.title || !payload.content) {
+      addToast('请填写笔记标题和内容', 'error');
+      return;
+    }
+    try {
+      const res = await fetch(`${API_BASE}/api/notes`, {
+        method: 'POST',
+        headers: authHeaders({ 'Content-Type': 'application/json' }),
+        body: JSON.stringify(payload)
+      });
+      const data = await res.json().catch(() => ({}));
+      if (res.status === 401) {
+        setNeedToken(true);
+        addToast('管理员 Token 无效，无法发布笔记', 'error');
+        return;
+      }
+      if (!res.ok || data.success === false) throw new Error(data.error || `HTTP ${res.status}`);
+      setNoteDraft({ title: '', content: '', tagsText: '', publicNote: false });
+      addToast('笔记已发布', 'success');
+      fetchNotes();
+    } catch (e) {
+      addToast(`发布笔记失败：${e.message || e}`, 'error');
     }
   };
 
@@ -807,6 +1001,42 @@ export default function App() {
         onRefreshLogs={fetchUploadLogs}
       />
 
+      <nav className="view-switch glass" aria-label="内容视图切换">
+        {[
+          { key: 'files', label: '☁️ 文件上传' },
+          { key: 'feed', label: `🎬 视频推荐 ${stats.feedVideoCount ? `(${stats.feedVideoCount})` : ''}` },
+          { key: 'notes', label: '📝 笔记' },
+        ].map(item => (
+          <button key={item.key} className={`view-tab ${activeView === item.key ? 'active' : ''}`} onClick={() => setActiveView(item.key)}>
+            {item.label}
+          </button>
+        ))}
+      </nav>
+
+      {activeView === 'feed' && (
+        <FeedSection
+          videos={feedVideos}
+          loading={feedLoading}
+          onRefresh={fetchFeedVideos}
+          onOpenSiteView={handleOpenSiteView}
+          onOpenDirectView={handleOpenDirectView}
+        />
+      )}
+
+      {activeView === 'notes' && (
+        <NotesSection
+          notes={notes}
+          loading={notesLoading}
+          adminMode={adminMode}
+          noteDraft={noteDraft}
+          setNoteDraft={setNoteDraft}
+          onCreateNote={handleCreateNote}
+          onRefresh={fetchNotes}
+        />
+      )}
+
+      {activeView === 'files' && (<>
+
       {/* Upload Zone */}
       <div
         className={`upload-zone glass ${dragging ? 'dragging' : ''}`}
@@ -820,6 +1050,15 @@ export default function App() {
           {uploading ? `${uploadStatusText || '上传中...'} ${uploadProgress}%` : '拖拽文件到此处、点击选择，或直接 Ctrl/⌘+V 粘贴上传'}
         </div>
         <div className="upload-subtitle">{adminMode ? '管理员 Token 已启用' : '访客默认'}：单文件最大 {formatSize(maxFileBytes)}；图片/视频/音频按原始文件上传不压缩；大文件自动分片断点续传；无访问 {expireAfterIdleDays} 天自动过期，访问或预览会把具体过期时间自动向后延期</div>
+        <label className="upload-feed-toggle" onClick={e => e.stopPropagation()}>
+          <input
+            type="checkbox"
+            checked={uploadFeedRequested}
+            onChange={e => setUploadFeedRequested(e.target.checked)}
+          />
+          <span>允许本次上传的视频申请进入推荐区</span>
+          <small>{adminMode ? '管理员上传会直接推荐；非视频自动忽略。' : '访客上传会进入待审核；审核通过后才会公开推荐。'}</small>
+        </label>
         <div className="upload-formats">
           {['PNG', 'JPG', 'GIF', 'WebP', 'SVG', 'MP4', 'MP3', 'PDF', 'ZIP', 'DOC'].map(f => (
             <span key={f} className="format-tag">{f}</span>
@@ -964,6 +1203,7 @@ export default function App() {
                     <span>{accessCountText(file)}</span>
                   </div>
                   <FileLifecycleMeta file={file} compact />
+                  {isVideoFile(file) && <div className={`feed-status-pill ${file.allowFeed && file.feedStatus === 'approved' ? 'active' : ''}`}>🎬 {getFeedBadge(file)}</div>}
                 </div>
                 <div className="file-actions">
                   <button
@@ -984,6 +1224,14 @@ export default function App() {
                   >
                     ↗ 跳转
                   </button>
+                  {isVideoFile(file) && (
+                    <button
+                      className="btn btn-copy"
+                      onClick={(e) => { e.stopPropagation(); handleToggleFeed(file, !(file.allowFeed && file.feedStatus === 'approved')); }}
+                    >
+                      {file.allowFeed && file.feedStatus === 'approved' ? '🙈 取消推荐' : '🎬 进推荐'}
+                    </button>
+                  )}
                   <button
                     className="btn btn-delete"
                     onClick={(e) => { e.stopPropagation(); handleDelete(file.id); }}
@@ -1037,6 +1285,7 @@ export default function App() {
           </button>
         </div>
       )}
+      </>)}
 
       <PreviewModal
         file={previewFile}

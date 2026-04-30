@@ -14,7 +14,11 @@ test('file listing and stats are public so all uploaded files can be displayed',
 
 test('mutating file management routes still require admin access', () => {
   assert.equal(routeRequiresAdmin('DELETE', '/api/files/demo123'), true);
+  assert.equal(routeRequiresAdmin('PATCH', '/api/files/demo123/feed'), true);
+  assert.equal(routeRequiresAdmin('POST', '/api/notes'), true);
+  assert.equal(routeRequiresAdmin('DELETE', '/api/notes/note123'), true);
   assert.equal(routeRequiresAdmin('POST', '/api/upload'), false);
+  assert.equal(routeRequiresAdmin('GET', '/api/feed/videos'), false);
 });
 
 test('public file records do not expose uploader IP addresses but keep lifecycle counters', () => {
