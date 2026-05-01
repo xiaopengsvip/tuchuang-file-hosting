@@ -12,6 +12,16 @@ Admin-only endpoints require:
 X-Admin-Token: <ADMIN_TOKEN>
 ```
 
+External storage API endpoints require one of these headers:
+
+```http
+Authorization: Bearer <STORAGE_API_KEY>
+X-API-Key: <STORAGE_API_KEY>
+X-Storage-Token: <STORAGE_API_KEY>
+```
+
+`STORAGE_API_KEYS` supports comma/newline separated keys. If no dedicated storage key is configured, the server falls back to `ADMIN_TOKEN` for storage API auth.
+
 ## Health
 
 ### GET /health
@@ -95,6 +105,88 @@ curl -X PUT "https://tc.allapple.top/api/uploads/$UPLOAD_ID/chunks/0" \
 ### POST /api/uploads/:uploadId/complete
 
 Merges uploaded chunks, runs moderation, writes metadata and returns the final file record.
+
+## External storage API
+
+These endpoints are intended for trusted external systems such as a video website. They use storage API key auth and return player-friendly URLs.
+
+### GET /api/storage/health
+
+Protected storage API health check. Returns feature availability, max file size and route hints.
+
+```bash
+curl https://tc.allapple.top/api/storage/health \
+  -H "Authorization: Bearer $STORAGE_API_KEY"
+```
+
+### POST /api/storage/upload
+
+Protected multipart upload. Accepts either `file` or `files` field names.
+
+```bash
+curl -X POST https://tc.allapple.top/api/storage/upload \
+  -H "Authorization: Bearer $STORAGE_API_KEY" \
+  -F "file=@./video.mp4" \
+  -F "title=示例视频" \
+  -F "description=视频网站存储测试" \
+  -F "tags=demo,video" \
+  -F "publish=true"
+```
+
+Optional metadata fields:
+
+- `title`: display title, max 180 chars.
+- `description`: max 2000 chars.
+- `tags`: comma-separated string or JSON array.
+- `visibility`: `private`, `unlisted`, `public`.
+- `publish=true`: for video files, sets `visibility=public`, `allowFeed=true`, `feedStatus=approved` so the video website can publish immediately.
+- `feedStatus`: optional override for video feed status: `hidden`, `pending`, `approved`, `rejected`.
+
+Response includes `files[]` with:
+
+- `id`
+- `kind`
+- `playUrl`: URL suitable for `<video src>` / player playback. Supports Range requests.
+- `viewUrl`: station preview URL.
+- `embedUrl`: preview URL with `?embed=1`.
+- `downloadUrl`: forced download/raw URL.
+- `shortUrl`
+- `deleteApi`: API path to delete this object.
+
+### GET /api/storage/files
+
+Protected management list.
+
+Parameters:
+
+- `page`: default `1`
+- `limit`: default `50`, max `200`
+- `search`: keyword search
+- `type`: `image`, `video`, `audio`, `document`, `other`
+- `sort`: `latest`, `access`, `expiring`, `largest`, `recommended`
+- `includeDeleted`: `true` to include soft-deleted metadata
+
+```bash
+curl "https://tc.allapple.top/api/storage/files?type=video&limit=20" \
+  -H "Authorization: Bearer $STORAGE_API_KEY"
+```
+
+### GET /api/storage/files/:id
+
+Protected detail lookup for one stored file.
+
+### DELETE /api/storage/files/:id
+
+Protected delete. Soft-deletes metadata in SQLite and removes the physical file from `uploads/` if it exists.
+
+```bash
+curl -X DELETE "https://tc.allapple.top/api/storage/files/$ID" \
+  -H "Authorization: Bearer $STORAGE_API_KEY"
+```
+
+### GET /api/storage/stats
+
+Protected storage statistics and active API upload limit.
 
 ## Files
 

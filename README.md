@@ -18,6 +18,7 @@
 - SQLite 元数据：文件、视频推荐、笔记、访问统计等信息写入 `data/tuchuang.sqlite`。
 - 内容平台能力：视频推荐区、文件笔记、管理端推荐审核与批量操作。
 - 内容安全：文件名/文本内容关键词过滤，图片/视频可接入本地 NudeNet + ffmpeg 媒体审核。
+- 外部存储 API：提供给视频网站/业务系统的鉴权上传、查询、删除、统计接口。
 - 安全响应头：默认设置 CSP、HSTS、X-Frame-Options、nosniff 等基础防护。
 
 ## 技术栈
@@ -92,6 +93,8 @@ npm run server   # 同 npm start
 | `ADMIN_TOKEN` / `TUCHUANG_ADMIN_TOKEN` | 空 | 管理员 token，启用删除、日志、视频推荐审核、笔记管理等操作 |
 | `PUBLIC_MAX_FILE_MB` | `1024` | 公开上传单文件上限，单位 MB |
 | `ADMIN_MAX_FILE_MB` | `10240` | 管理员上传单文件上限，单位 MB |
+| `STORAGE_API_KEYS` | 空 | 外部存储 API key，支持逗号/换行分隔；为空时回退允许 `ADMIN_TOKEN` |
+| `STORAGE_API_MAX_FILE_MB` | `ADMIN_MAX_FILE_MB` | 外部存储 API 单文件上限，单位 MB |
 | `MAX_FILES` | `50` | 单次最多上传文件数 |
 | `UPLOAD_DIR` | `./uploads` | 上传文件保存目录 |
 | `QUARANTINE_DIR` | `UPLOAD_DIR/.quarantine` | 审核通过前的临时隔离目录 |
@@ -125,6 +128,9 @@ npm run server   # 同 npm start
 - `GET /api/stats`：统计信息。
 - `GET /api/feed/videos`：公开视频推荐流。
 - `GET /api/notes`：公开笔记列表，带管理员 token 时可查看私有笔记。
+- `POST /api/storage/upload`：外部存储 API 上传，支持 `file` 或 `files` 字段，适合视频网站接入。
+- `GET /api/storage/files` / `GET /api/storage/files/:id`：外部存储 API 查询文件。
+- `DELETE /api/storage/files/:id`：外部存储 API 删除文件和元数据。
 - `GET /s/:id`：短链跳转。
 - `GET /preview/:id`：站内预览页。
 
@@ -133,6 +139,33 @@ npm run server   # 同 npm start
 ```text
 X-Admin-Token: <ADMIN_TOKEN>
 ```
+
+外部存储 API 建议使用独立 key：
+
+```text
+Authorization: Bearer <STORAGE_API_KEY>
+```
+
+也支持 `X-API-Key` 或 `X-Storage-Token`。如果没有配置 `STORAGE_API_KEYS`，会回退允许 `ADMIN_TOKEN`。
+
+### 视频网站接入示例
+
+```bash
+curl -X POST https://tc.allapple.top/api/storage/upload \
+  -H "Authorization: Bearer $STORAGE_API_KEY" \
+  -F "file=@./video.mp4" \
+  -F "title=示例视频" \
+  -F "description=给视频网站使用的外链视频" \
+  -F "tags=demo,video" \
+  -F "publish=true"
+```
+
+返回里会包含：
+
+- `playUrl`：播放器可直接使用的文件 URL。
+- `embedUrl`：站内预览嵌入 URL。
+- `downloadUrl`：下载/原始文件 URL。
+- `deleteApi`：删除该文件的 API 路径。
 
 ## 部署说明
 

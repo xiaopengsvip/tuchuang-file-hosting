@@ -47,6 +47,13 @@ import {
   moderateMediaFile,
   publishQuarantinedFile
 } from './src/mediaModeration.js';
+import {
+  buildStorageMetadataPatch,
+  buildStorageRecordResponse,
+  extractStorageApiToken,
+  isStorageApiAuthorized,
+  parseStorageApiKeys
+} from './src/storageApi.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -63,6 +70,7 @@ const SHORT_BASE_URL = process.env.SHORT_BASE_URL || 'https://tc.allapple.top';
 const ADMIN_TOKEN = process.env.TUCHUANG_ADMIN_TOKEN || process.env.ADMIN_TOKEN || '';
 const PUBLIC_UPLOAD_MAX_FILE_MB = Number(process.env.PUBLIC_MAX_FILE_MB || PUBLIC_MAX_FILE_MB || DEFAULT_MAX_FILE_MB);
 const ADMIN_UPLOAD_MAX_FILE_MB = Number(process.env.ADMIN_MAX_FILE_MB || process.env.MAX_FILE_MB || ADMIN_MAX_FILE_MB);
+const STORAGE_API_MAX_FILE_MB = Number(process.env.STORAGE_API_MAX_FILE_MB || process.env.STORAGE_MAX_FILE_MB || ADMIN_UPLOAD_MAX_FILE_MB);
 const MAX_FILES = Number(process.env.MAX_FILES || 50);
 const INDEX_FILE = process.env.INDEX_FILE || path.join(__dirname, 'file-index.json');
 const CLEANUP_INTERVAL_MS = Number(process.env.CLEANUP_INTERVAL_MS || 60 * 60 * 1000);
@@ -77,6 +85,7 @@ fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 fs.mkdirSync(QUARANTINE_DIR, { recursive: true });
 fs.mkdirSync(CHUNK_DIR, { recursive: true });
 const MEDIA_MODERATION_CONFIG = buildMediaModerationConfig(process.env);
+const STORAGE_API_KEYS = parseStorageApiKeys(process.env, { fallbackToken: ADMIN_TOKEN });
 const uploadLogger = createUploadLogger({ logDir: LOG_DIR });
 const uploadLogRateLimit = createIpRateLimiter({ windowMs: 60 * 1000, max: 60, keyPrefix: 'upload-log' });
 
@@ -125,6 +134,40 @@ function isAuthed(req) {
 function requireAdmin(req, res, next) {
   if (isAuthed(req)) return next();
   return res.status(401).json({ success: false, error: 'ADMIN_TOKEN required' });
+}
+
+function requestStorageToken(req) {
+  return extractStorageApiToken({
+    authorization: req.get('authorization'),
+    'x-api-key': req.get('x-api-key'),
+    'x-storage-token': req.get('x-storage-token'),
+    'x-admin-token': req.get('x-admin-token')
+  });
+}
+
+function isStorageApiAuthed(req) {
+  return isStorageApiAuthorized(requestStorageToken(req), STORAGE_API_KEYS);
+}
+
+function requireStorageApi(req, res, next) {
+  if (isStorageApiAuthed(req)) return next();
+  return res.status(401).json({
+    success: false,
+    error: 'Storage API key required',
+    auth: 'Use Authorization: Bearer <STORAGE_API_KEY> or X-API-Key'
+  });
+}
+
+function getStorageApiLimit() {
+  return {
+    tier: 'storage-api',
+    maxFileMB: STORAGE_API_MAX_FILE_MB,
+    maxFileGB: STORAGE_API_MAX_FILE_MB / 1024,
+    maxFileBytes: STORAGE_API_MAX_FILE_MB * BYTES_PER_MB,
+    publicMaxFileMB: PUBLIC_UPLOAD_MAX_FILE_MB,
+    adminMaxFileMB: ADMIN_UPLOAD_MAX_FILE_MB,
+    storageApiMaxFileMB: STORAGE_API_MAX_FILE_MB
+  };
 }
 
 function getUploadLimit(req) {
@@ -375,12 +418,27 @@ function makeUpload(maxFileMB) {
 
 const publicUpload = makeUpload(PUBLIC_UPLOAD_MAX_FILE_MB);
 const adminUpload = makeUpload(ADMIN_UPLOAD_MAX_FILE_MB);
+const storageApiUpload = makeUpload(STORAGE_API_MAX_FILE_MB);
 
 function uploadArrayForRequest(req, res, next) {
   const limit = getUploadLimit(req);
   req.uploadLimit = limit;
   const middleware = limit.tier === 'admin' ? adminUpload : publicUpload;
   return middleware.array('files', MAX_FILES)(req, res, next);
+}
+
+function storageApiUploadFields(req, res, next) {
+  req.uploadLimit = getStorageApiLimit();
+  return storageApiUpload.fields([
+    { name: 'file', maxCount: 1 },
+    { name: 'files', maxCount: MAX_FILES }
+  ])(req, res, next);
+}
+
+function uploadedFilesFromRequest(req) {
+  if (Array.isArray(req.files)) return req.files;
+  if (!req.files || typeof req.files !== 'object') return [];
+  return Object.values(req.files).flat().filter(Boolean);
 }
 
 function markSimpleUploadStart(req, res, next) {
@@ -491,6 +549,10 @@ app.get('/health', (req, res) => {
     publicMaxFileGB: PUBLIC_UPLOAD_MAX_FILE_MB / 1024,
     adminMaxFileMB: ADMIN_UPLOAD_MAX_FILE_MB,
     adminMaxFileGB: ADMIN_UPLOAD_MAX_FILE_MB / 1024,
+    storageApi: STORAGE_API_KEYS.length > 0,
+    storageApiMaxFileMB: STORAGE_API_MAX_FILE_MB,
+    storageApiMaxFileGB: STORAGE_API_MAX_FILE_MB / 1024,
+    storageApiAuth: ['Authorization: Bearer', 'X-API-Key', 'X-Storage-Token'],
     maxFiles: MAX_FILES,
     maxFilesPerUpload: MAX_FILES,
     expireAfterIdleDays: FILE_EXPIRY_DAYS,
@@ -711,6 +773,124 @@ app.post('/api/upload', markSimpleUploadStart, uploadArrayForRequest, async (req
   res.json({ success: true, uploadTier: limit.tier, maxFileMB: limit.maxFileMB, logId: logEntry.id, files: results });
   } catch (err) {
     cleanupStoredUploadFiles(req.files || []);
+    next(err);
+  }
+});
+
+app.get('/api/storage/health', requireStorageApi, (req, res) => {
+  const stats = contentDb.stats();
+  const limit = getStorageApiLimit();
+  res.json({
+    success: true,
+    service: 'tuchuang-storage-api',
+    storageApi: true,
+    metadataStore: 'sqlite',
+    dbFile: path.basename(DB_FILE),
+    files: stats.totalFiles,
+    videoCount: stats.videoCount,
+    maxFileMB: limit.maxFileMB,
+    maxFileGB: limit.maxFileGB,
+    maxFiles: MAX_FILES,
+    uploadFieldNames: ['file', 'files'],
+    endpoints: {
+      upload: 'POST /api/storage/upload',
+      list: 'GET /api/storage/files',
+      detail: 'GET /api/storage/files/:id',
+      delete: 'DELETE /api/storage/files/:id',
+      stats: 'GET /api/storage/stats'
+    }
+  });
+});
+
+app.get('/api/storage/stats', requireStorageApi, (req, res) => {
+  const limit = getStorageApiLimit();
+  res.json({ success: true, storageApi: true, stats: contentDb.stats(), limit });
+});
+
+app.get('/api/storage/files', requireStorageApi, (req, res) => {
+  const page = Math.max(parseInt(req.query.page) || 1, 1);
+  const limit = Math.min(Math.max(parseInt(req.query.limit) || 50, 1), 200);
+  const search = String(req.query.search || '').toLowerCase();
+  const typeFilter = String(req.query.type || '');
+  const sort = String(req.query.sort || 'latest');
+  const includeDeleted = ['1', 'true', 'yes'].includes(String(req.query.includeDeleted || '').toLowerCase());
+  const result = contentDb.listFiles({ page, limit, search, type: typeFilter, sort, includeDeleted });
+  res.json({
+    success: true,
+    storageApi: true,
+    files: result.files.map(file => buildStorageRecordResponse(publicRecord(file, req))),
+    pagination: result.pagination
+  });
+});
+
+app.get('/api/storage/files/:id', requireStorageApi, (req, res) => {
+  const record = getRecordById(req.params.id);
+  if (!record) return res.status(404).json({ success: false, error: 'File not found' });
+  res.json({ success: true, storageApi: true, file: buildStorageRecordResponse(publicRecord(record, req)) });
+});
+
+app.delete('/api/storage/files/:id', requireStorageApi, (req, res) => {
+  const record = getRecordById(req.params.id);
+  if (!record) return res.status(404).json({ success: false, error: 'File not found' });
+  const storedName = safeName(record.storedName || record.filename);
+  const filePath = path.join(UPLOAD_DIR, storedName);
+  const deletedFromDb = contentDb.deleteFile(record.id || req.params.id);
+  const fileExisted = fs.existsSync(filePath);
+  if (fileExisted) fs.unlinkSync(filePath);
+  res.json({ success: true, storageApi: true, id: record.id || req.params.id, deletedFromDb, fileDeleted: fileExisted });
+});
+
+app.post('/api/storage/upload', requireStorageApi, markSimpleUploadStart, storageApiUploadFields, async (req, res, next) => {
+  const files = uploadedFilesFromRequest(req);
+  try {
+    if (files.length === 0) {
+      const logEntry = logSimpleUploadAccess(req, { status: 400, error: 'No files uploaded' });
+      return res.status(400).json({ success: false, error: 'No files uploaded', logId: logEntry.id });
+    }
+
+    const limit = req.uploadLimit || getStorageApiLimit();
+    for (const file of files) {
+      const originalName = normalizeOriginalName(file.originalname || file.filename);
+      const mimeType = file.mimetype || mime.lookup(originalName) || 'application/octet-stream';
+      const moderation = await moderateStoredCandidate(req, {
+        filePath: file.path,
+        originalName,
+        filename: file.filename,
+        mimeType,
+        fields: req.body || {},
+        flow: 'storage_api_upload'
+      });
+      if (moderation) {
+        cleanupStoredUploadFiles(files);
+        const logEntry = logSimpleUploadAccess(req, { status: 451, files, error: 'content_moderation_blocked' });
+        return rejectModeratedRequest(res, moderation, { logId: logEntry.id });
+      }
+    }
+
+    const results = files.map(file => {
+      publishAcceptedMulterFile(file);
+      const id = path.basename(file.filename, path.extname(file.filename));
+      const originalName = normalizeOriginalName(file.originalname || file.filename);
+      const mimeType = file.mimetype || mime.lookup(originalName) || 'application/octet-stream';
+      let record = buildFileRecord({
+        id,
+        originalName,
+        filename: file.filename,
+        storedName: file.filename,
+        size: file.size,
+        mimeType,
+        uploaderIp: req.ip
+      });
+      const metadataPatch = buildStorageMetadataPatch(req.body || {}, { mimeType, mediaType: record.mediaType });
+      record = { ...record, ...metadataPatch, uploadTier: limit.tier };
+      syncRecordToDb(record);
+      return buildStorageRecordResponse(publicRecord(record, req));
+    });
+
+    const logEntry = logSimpleUploadAccess(req, { status: 200, files });
+    res.json({ success: true, storageApi: true, uploadTier: limit.tier, maxFileMB: limit.maxFileMB, logId: logEntry.id, files: results });
+  } catch (err) {
+    cleanupStoredUploadFiles(files);
     next(err);
   }
 });

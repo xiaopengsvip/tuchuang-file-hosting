@@ -22,6 +22,7 @@ Edit `.env` and set at least:
 
 ```env
 ADMIN_TOKEN=<strong-random-token>
+STORAGE_API_KEYS=<strong-random-storage-api-key>
 BASE_URL=https://tuchuang.allapple.top
 SHORT_BASE_URL=https://tc.allapple.top
 ```
