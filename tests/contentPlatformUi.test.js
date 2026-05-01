@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { buildFeedSettingsPayload, getFeedBadge, normalizeNoteDraft, buildUploadFeedPreference } from '../src/contentPlatformUi.js';
+import { buildFeedSettingsPayload, getFeedBadge, normalizeNoteDraft, buildUploadFeedPreference, buildFeedBatchPayload } from '../src/contentPlatformUi.js';
 
 test('buildFeedSettingsPayload explicitly approves video feed opt-in and hides opt-out', () => {
   assert.deepEqual(buildFeedSettingsPayload({ mimeType: 'video/mp4', originalName: 'demo.mp4' }, true), {
@@ -37,4 +37,14 @@ test('normalizeNoteDraft trims title/content and defaults notes to private markd
 test('buildUploadFeedPreference sends an explicit opt-in marker only when enabled', () => {
   assert.equal(buildUploadFeedPreference(true), 'request');
   assert.equal(buildUploadFeedPreference(false), '');
+});
+
+test('buildFeedBatchPayload normalizes selected ids and supports clear-approved shortcut', () => {
+  assert.deepEqual(buildFeedBatchPayload('approve', [' v1 ', 'v2', 'v1', '', null]), {
+    action: 'approve',
+    ids: ['v1', 'v2'],
+  });
+  assert.deepEqual(buildFeedBatchPayload('clear-approved', ['ignored']), {
+    action: 'clear-approved',
+  });
 });

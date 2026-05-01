@@ -37,6 +37,16 @@ import { createUploadLogger, errorMessage, buildSimpleUploadAccessEvent } from '
 import { createIpRateLimiter } from './src/rateLimit.js';
 import { createContentDb } from './src/contentDb.js';
 import { applyUploadFeedPreference, isFeedPreferenceRequested } from './src/feedPolicy.js';
+import {
+  moderateUploadCandidate,
+  moderationErrorPayload,
+  readTextSampleForModeration
+} from './src/contentModeration.js';
+import {
+  buildMediaModerationConfig,
+  moderateMediaFile,
+  publishQuarantinedFile
+} from './src/mediaModeration.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -47,9 +57,10 @@ app.set('trust proxy', true);
 
 const PORT = Number(process.env.PORT || 8765);
 const UPLOAD_DIR = process.env.UPLOAD_DIR || path.join(__dirname, 'uploads');
+const QUARANTINE_DIR = process.env.QUARANTINE_DIR || path.join(UPLOAD_DIR, '.quarantine');
 const BASE_URL = process.env.BASE_URL || 'https://tuchuang.allapple.top';
 const SHORT_BASE_URL = process.env.SHORT_BASE_URL || 'https://tc.allapple.top';
-const ADMIN_TOKEN = process.env.SUPER_ADMIN_TOKEN || process.env.ADMIN_TOKEN || '';
+const ADMIN_TOKEN = process.env.TUCHUANG_ADMIN_TOKEN || process.env.ADMIN_TOKEN || '';
 const PUBLIC_UPLOAD_MAX_FILE_MB = Number(process.env.PUBLIC_MAX_FILE_MB || PUBLIC_MAX_FILE_MB || DEFAULT_MAX_FILE_MB);
 const ADMIN_UPLOAD_MAX_FILE_MB = Number(process.env.ADMIN_MAX_FILE_MB || process.env.MAX_FILE_MB || ADMIN_MAX_FILE_MB);
 const MAX_FILES = Number(process.env.MAX_FILES || 50);
@@ -63,7 +74,9 @@ const LOG_DIR = process.env.LOG_DIR || path.join(__dirname, 'logs');
 const DB_FILE = process.env.DB_FILE || path.join(__dirname, 'data', 'tuchuang.sqlite');
 
 fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+fs.mkdirSync(QUARANTINE_DIR, { recursive: true });
 fs.mkdirSync(CHUNK_DIR, { recursive: true });
+const MEDIA_MODERATION_CONFIG = buildMediaModerationConfig(process.env);
 const uploadLogger = createUploadLogger({ logDir: LOG_DIR });
 const uploadLogRateLimit = createIpRateLimiter({ windowMs: 60 * 1000, max: 60, keyPrefix: 'upload-log' });
 
@@ -229,7 +242,10 @@ function cleanupChunkSessions(now = Date.now()) {
 }
 
 function getRecordById(id) {
-  return Object.values(fileIndex).find(f => f.id === id || f.filename === id) || contentDb.getFileById(id);
+  const dbRecord = contentDb.getFileById(id);
+  if (dbRecord) return dbRecord;
+  const legacyRecord = Object.values(fileIndex).find(f => f.id === id || f.filename === id || f.storedName === id);
+  return legacyRecord ? contentDb.upsertFile(legacyRecord) : null;
 }
 
 function publicRecord(record, req) {
@@ -295,7 +311,7 @@ if (nameMigration.changed > 0) {
 const contentDb = createContentDb({ filename: DB_FILE });
 const dbImport = contentDb.importFileIndex(fileIndex);
 if (dbImport.inserted > 0 || dbImport.updated > 0) {
-  console.log(`[Tuchuang] Metadata DB synced: ${dbImport.inserted} inserted, ${dbImport.updated} updated`);
+  console.log(`[Tuchuang] Metadata DB migration: ${dbImport.inserted} inserted, ${dbImport.updated} updated, ${dbImport.skippedExisting || 0} preserved`);
 }
 
 function syncRecordToDb(record) {
@@ -311,14 +327,17 @@ function syncRecordToIndex(record) {
 }
 
 function runExpiryCleanup(reason = 'scheduled') {
-  const before = new Map(Object.entries(fileIndex).map(([key, record]) => [key, record?.id || record?.filename || key]));
-  const result = cleanupExpiredRecords({ fileIndex, uploadDir: UPLOAD_DIR });
+  const activeFiles = contentDb.allActiveFiles();
+  const cleanupIndex = Object.fromEntries(
+    activeFiles.map(record => [record.filename || record.storedName || record.id, { ...record }])
+  );
+  const before = new Map(Object.values(cleanupIndex).map(record => [record.filename || record.storedName || record.id, record.id || record.filename]));
+  const result = cleanupExpiredRecords({ fileIndex: cleanupIndex, uploadDir: UPLOAD_DIR });
   if (result.deleted > 0) {
     for (const [key, id] of before.entries()) {
-      if (!fileIndex[key]) contentDb.deleteFile(id);
+      if (!cleanupIndex[key]) contentDb.deleteFile(id);
     }
-    saveIndex();
-    console.log(`[Tuchuang] Deleted ${result.deleted} expired file(s) (${reason})`);
+    console.log(`[Tuchuang] Deleted ${result.deleted} expired file(s) from DB metadata (${reason})`);
   }
   if (result.errors?.length) {
     console.error('[Tuchuang] Expiry cleanup errors:', result.errors);
@@ -339,7 +358,7 @@ const cleanupTimer = setInterval(() => {
 cleanupTimer.unref?.();
 
 const storage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, UPLOAD_DIR),
+  destination: (req, file, cb) => cb(null, QUARANTINE_DIR),
   filename: (req, file, cb) => {
     const id = crypto.randomUUID().replace(/-/g, '').slice(0, 12);
     const ext = path.extname(safeName(file.originalname)).slice(0, 32);
@@ -382,21 +401,89 @@ function logSimpleUploadAccess(req, { status, files = [], error } = {}) {
   }), req);
 }
 
+function cleanupStoredUploadFiles(files = []) {
+  for (const file of files) {
+    if (file?.path) fs.rmSync(file.path, { force: true });
+  }
+}
+
+function rejectModeratedRequest(res, result, extra = {}) {
+  return res.status(451).json({ ...moderationErrorPayload(result), ...extra });
+}
+
+function logModerationBlock(req, { flow, categories, originalName } = {}) {
+  return uploadLogger.log({
+    event: 'content_moderation_blocked',
+    level: 'warn',
+    flow,
+    categories,
+    originalName,
+  }, req);
+}
+
+function logMediaModerationUnavailable(req, { flow, originalName, error } = {}) {
+  return uploadLogger.log({
+    event: 'media_moderation_unavailable',
+    level: 'warn',
+    flow,
+    originalName,
+    error,
+  }, req);
+}
+
+async function moderateStoredCandidate(req, { filePath, originalName, filename = '', mimeType = '', fields = {}, flow = 'upload' } = {}) {
+  const textResult = moderateUploadCandidate({
+    originalName,
+    filename,
+    mimeType,
+    fields,
+    textSample: readTextSampleForModeration(filePath, { mimeType, originalName })
+  });
+  if (textResult.blocked) {
+    logModerationBlock(req, { flow, categories: textResult.categories, originalName });
+    return textResult;
+  }
+
+  const mediaResult = await moderateMediaFile({
+    filePath,
+    originalName,
+    mimeType,
+    config: MEDIA_MODERATION_CONFIG
+  });
+  if (mediaResult.unavailable) {
+    logMediaModerationUnavailable(req, { flow, originalName, error: mediaResult.error });
+  }
+  if (mediaResult.blocked) {
+    logModerationBlock(req, { flow, categories: mediaResult.categories, originalName });
+    return mediaResult;
+  }
+  return null;
+}
+
+function publishAcceptedMulterFile(file) {
+  const finalPath = publishQuarantinedFile({ quarantinePath: file.path, uploadDir: UPLOAD_DIR, storedName: file.filename });
+  file.path = finalPath;
+  file.destination = UPLOAD_DIR;
+  return finalPath;
+}
+
 function isSimpleUploadRequest(req) {
   return req?.method === 'POST' && req?.path === '/api/upload';
 }
 
 app.use(addSecurityHeaders);
-app.use(cors({ origin: '*', allowedHeaders: ['Content-Type', 'X-Admin-Token', 'Range'], methods: ['GET', 'HEAD', 'POST', 'PUT', 'DELETE', 'OPTIONS'] }));
+app.use(cors({ origin: '*', allowedHeaders: ['Content-Type', 'X-Admin-Token', 'Range'], methods: ['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'] }));
 app.use(express.json({ limit: '2mb' }));
 
 app.get('/health', (req, res) => {
-  const files = Object.values(fileIndex);
+  const dbStats = contentDb.stats();
   const limit = getUploadLimit(req);
   res.json({
     success: true,
     service: 'tuchuang-file-hosting',
-    files: files.length,
+    files: dbStats.totalFiles,
+    metadataStore: 'sqlite',
+    dbFile: path.basename(DB_FILE),
     uploadTier: limit.tier,
     maxFileMB: limit.maxFileMB,
     maxFileGB: limit.maxFileGB,
@@ -412,7 +499,16 @@ app.get('/health', (req, res) => {
     publicUpload: true,
     resumableUpload: true,
     resumableChunkSize: RESUMABLE_CHUNK_SIZE,
-    uploadLogs: true
+    uploadLogs: true,
+    contentModeration: true,
+    mediaModeration: {
+      enabled: MEDIA_MODERATION_CONFIG.enabled,
+      provider: 'local-nudenet',
+      blockOnUnavailable: MEDIA_MODERATION_CONFIG.blockOnUnavailable,
+      maxVideoFrames: MEDIA_MODERATION_CONFIG.maxVideoFrames,
+      videoFrameIntervalSeconds: MEDIA_MODERATION_CONFIG.videoFrameIntervalSeconds
+    },
+    blockedCategories: ['sexual', 'gambling', 'drugs']
   });
 });
 
@@ -434,11 +530,17 @@ app.post('/api/uploads/init', (req, res) => {
   }
 
   const originalName = normalizeOriginalName(req.body?.originalName || req.body?.name || 'file');
+  const mimeType = req.body?.mimeType || mime.lookup(originalName) || 'application/octet-stream';
+  const moderation = moderateUploadCandidate({ originalName, mimeType, fields: req.body || {} });
+  if (moderation.blocked) {
+    logModerationBlock(req, { flow: 'resumable_init', categories: moderation.categories, originalName });
+    return rejectModeratedRequest(res, moderation);
+  }
   const manifest = buildUploadManifest({
     fingerprint: req.body?.fingerprint || `${originalName}:${size}:${req.body?.lastModified || ''}`,
     originalName,
     size,
-    mimeType: req.body?.mimeType || mime.lookup(originalName) || 'application/octet-stream',
+    mimeType,
     chunkSize: req.body?.chunkSize || RESUMABLE_CHUNK_SIZE,
     lastModified: req.body?.lastModified
   });
@@ -493,7 +595,8 @@ app.put('/api/uploads/:uploadId/chunks/:index', express.raw({ type: '*/*', limit
   res.json({ success: true, ...getUploadStatus(manifest) });
 });
 
-app.post('/api/uploads/:uploadId/complete', (req, res) => {
+app.post('/api/uploads/:uploadId/complete', async (req, res, next) => {
+  try {
   const manifest = readManifest(req.params.uploadId);
   if (!manifest) return res.status(404).json({ success: false, error: 'Upload session not found' });
   if (manifest.complete && manifest.file) return res.json({ success: true, file: publicRecord(manifest.file, req), ...getUploadStatus(manifest) });
@@ -506,7 +609,7 @@ app.post('/api/uploads/:uploadId/complete', (req, res) => {
   const id = crypto.randomUUID().replace(/-/g, '').slice(0, 12);
   const ext = path.extname(safeName(manifest.originalName)).slice(0, 32);
   const storedName = `${id}${ext}`;
-  const outputPath = path.join(UPLOAD_DIR, storedName);
+  const outputPath = path.join(QUARANTINE_DIR, storedName);
   const fd = fs.openSync(outputPath, 'wx');
   try {
     for (let i = 0; i < manifest.totalChunks; i += 1) {
@@ -516,6 +619,22 @@ app.post('/api/uploads/:uploadId/complete', (req, res) => {
   } finally {
     fs.closeSync(fd);
   }
+
+  const completeModeration = await moderateStoredCandidate(req, {
+    filePath: outputPath,
+    originalName: manifest.originalName,
+    filename: storedName,
+    mimeType: manifest.mimeType || mime.lookup(manifest.originalName) || 'application/octet-stream',
+    fields: manifest,
+    flow: 'resumable_complete'
+  });
+  if (completeModeration) {
+    fs.rmSync(outputPath, { force: true });
+    removeChunkSession(manifest.uploadId);
+    return rejectModeratedRequest(res, completeModeration);
+  }
+
+  const finalPath = publishQuarantinedFile({ quarantinePath: outputPath, uploadDir: UPLOAD_DIR, storedName });
 
   let record = buildFileRecord({
     id,
@@ -531,18 +650,20 @@ app.post('/api/uploads/:uploadId/complete', (req, res) => {
     requested: manifest.feedRequested,
     isAdmin: Boolean(manifest.feedRequestedByAdmin || record.uploadTier === 'admin')
   });
-  fileIndex[storedName] = record;
   syncRecordToDb(record);
-  saveIndex();
 
   manifest.complete = true;
   manifest.file = record;
   writeManifest(manifest);
   removeUploadedChunks(manifest.uploadId);
   res.json({ success: true, file: publicRecord(record, req) });
+  } catch (err) {
+    next(err);
+  }
 });
 
-app.post('/api/upload', markSimpleUploadStart, uploadArrayForRequest, (req, res) => {
+app.post('/api/upload', markSimpleUploadStart, uploadArrayForRequest, async (req, res, next) => {
+  try {
   if (!req.files || req.files.length === 0) {
     const logEntry = logSimpleUploadAccess(req, { status: 400, error: 'No files uploaded' });
     return res.status(400).json({ success: false, error: 'No files uploaded', logId: logEntry.id });
@@ -550,7 +671,25 @@ app.post('/api/upload', markSimpleUploadStart, uploadArrayForRequest, (req, res)
 
   const limit = req.uploadLimit || getUploadLimit(req);
   const feedRequested = uploadFeedRequested(req.body || {});
+  for (const file of req.files) {
+    const originalName = normalizeOriginalName(file.originalname || file.filename);
+    const mimeType = file.mimetype || mime.lookup(originalName) || 'application/octet-stream';
+    const moderation = await moderateStoredCandidate(req, {
+      filePath: file.path,
+      originalName,
+      filename: file.filename,
+      mimeType,
+      fields: req.body || {},
+      flow: 'simple_upload'
+    });
+    if (moderation) {
+      cleanupStoredUploadFiles(req.files);
+      const logEntry = logSimpleUploadAccess(req, { status: 451, files: req.files, error: 'content_moderation_blocked' });
+      return rejectModeratedRequest(res, moderation, { logId: logEntry.id });
+    }
+  }
   const results = req.files.map(file => {
+    publishAcceptedMulterFile(file);
     const id = path.basename(file.filename, path.extname(file.filename));
     const originalName = normalizeOriginalName(file.originalname || file.filename);
     let record = buildFileRecord({
@@ -564,14 +703,16 @@ app.post('/api/upload', markSimpleUploadStart, uploadArrayForRequest, (req, res)
     });
     record.uploadTier = limit.tier;
     record = applyUploadFeedFields(record, { requested: feedRequested, isAdmin: limit.tier === 'admin' });
-    fileIndex[file.filename] = record;
     syncRecordToDb(record);
     return publicRecord(record, req);
   });
 
-  saveIndex();
   const logEntry = logSimpleUploadAccess(req, { status: 200, files: req.files });
   res.json({ success: true, uploadTier: limit.tier, maxFileMB: limit.maxFileMB, logId: logEntry.id, files: results });
+  } catch (err) {
+    cleanupStoredUploadFiles(req.files || []);
+    next(err);
+  }
 });
 
 app.get('/api/files', (req, res) => {
@@ -579,7 +720,8 @@ app.get('/api/files', (req, res) => {
   const limit = Math.min(Math.max(parseInt(req.query.limit) || 50, 1), 200);
   const search = String(req.query.search || '').toLowerCase();
   const typeFilter = String(req.query.type || '');
-  const result = contentDb.listFiles({ page, limit, search, type: typeFilter });
+  const sort = String(req.query.sort || 'latest');
+  const result = contentDb.listFiles({ page, limit, search, type: typeFilter, sort });
   res.json({
     success: true,
     files: result.files.map(file => publicRecord(file, req)),
@@ -596,9 +738,38 @@ app.get('/api/feed/videos', (req, res) => {
   });
 });
 
+app.get('/api/admin/feed/videos', requireAdmin, (req, res) => {
+  const result = contentDb.listFeedManagementVideos({
+    page: req.query.page || 1,
+    limit: req.query.limit || 80,
+    feedStatus: req.query.status || req.query.feedStatus || 'all',
+    search: req.query.search || '',
+  });
+  res.json({
+    success: true,
+    files: result.files.map(file => publicRecord(file, req)),
+    pagination: result.pagination,
+    summary: result.summary,
+  });
+});
+
+app.post('/api/admin/feed/batch', requireAdmin, (req, res) => {
+  try {
+    const result = contentDb.bulkUpdateFeed({ action: req.body?.action, ids: req.body?.ids || [] });
+    res.json({ success: true, ...result, summary: contentDb.listFeedManagementVideos({ limit: 1 }).summary });
+  } catch (err) {
+    res.status(400).json({ success: false, error: err?.message || 'Invalid feed batch action' });
+  }
+});
+
 app.patch('/api/files/:id/feed', requireAdmin, (req, res) => {
   const existing = contentDb.getFileById(req.params.id);
   if (!existing) return res.status(404).json({ success: false, error: 'File not found' });
+  const moderation = moderateUploadCandidate({ title: req.body?.title, description: req.body?.description, tags: req.body?.tags });
+  if (moderation.blocked) {
+    logModerationBlock(req, { flow: 'feed_metadata', categories: moderation.categories, originalName: existing.originalName });
+    return rejectModeratedRequest(res, moderation);
+  }
   const wantsFeed = req.body?.allowFeed === true || req.body?.allowFeed === 'true';
   if (wantsFeed && existing.mediaType !== 'video') {
     return res.status(400).json({ success: false, error: 'Only video files can enter feed' });
@@ -612,8 +783,6 @@ app.patch('/api/files/:id/feed', requireAdmin, (req, res) => {
     tags: req.body?.tags,
   });
   if (!updated) return res.status(404).json({ success: false, error: 'File not found' });
-  syncRecordToIndex(updated);
-  saveIndex();
   res.json({ success: true, file: publicRecord(updated, req) });
 });
 
@@ -626,6 +795,11 @@ app.get('/api/notes', (req, res) => {
 app.post('/api/notes', requireAdmin, (req, res) => {
   const fileId = String(req.body?.fileId || '');
   if (fileId && !contentDb.getFileById(fileId)) return res.status(404).json({ success: false, error: 'File not found' });
+  const moderation = moderateUploadCandidate({ title: req.body?.title, description: req.body?.content, tags: req.body?.tags });
+  if (moderation.blocked) {
+    logModerationBlock(req, { flow: 'note', categories: moderation.categories, originalName: fileId });
+    return rejectModeratedRequest(res, moderation);
+  }
   const note = contentDb.createNote({
     fileId,
     title: req.body?.title || '',
@@ -635,6 +809,31 @@ app.post('/api/notes', requireAdmin, (req, res) => {
     pinned: req.body?.pinned === true,
     tags: req.body?.tags || [],
   });
+  res.json({ success: true, note });
+});
+
+app.get('/api/notes/:id/history', requireAdmin, (req, res) => {
+  const result = contentDb.listNoteHistory(req.params.id, { includeDeleted: true });
+  res.json({ success: true, history: result.history });
+});
+
+app.patch('/api/notes/:id', requireAdmin, (req, res) => {
+  const existing = contentDb.getNote(req.params.id);
+  if (!existing) return res.status(404).json({ success: false, error: 'Note not found' });
+  const moderation = moderateUploadCandidate({ title: req.body?.title, description: req.body?.content, tags: req.body?.tags });
+  if (moderation.blocked) {
+    logModerationBlock(req, { flow: 'note_update', categories: moderation.categories, originalName: req.params.id });
+    return rejectModeratedRequest(res, moderation);
+  }
+  const note = contentDb.updateNote(req.params.id, {
+    title: req.body?.title,
+    content: req.body?.content,
+    contentFormat: req.body?.contentFormat,
+    visibility: req.body?.visibility,
+    pinned: req.body?.pinned,
+    tags: req.body?.tags,
+  });
+  if (!note) return res.status(404).json({ success: false, error: 'Note not found' });
   res.json({ success: true, note });
 });
 
@@ -670,9 +869,7 @@ app.delete('/api/files/:id', requireAdmin, (req, res) => {
   if (!record) return res.status(404).json({ success: false, error: 'File not found' });
   const storedName = safeName(record.storedName || record.filename);
   const filePath = path.join(UPLOAD_DIR, storedName);
-  delete fileIndex[record.filename || storedName];
   contentDb.deleteFile(record.id || id);
-  saveIndex();
   if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
   res.json({ success: true });
 });
@@ -711,7 +908,6 @@ function sendFileRecord(req, res, requestedDisposition = 'inline') {
   if (shouldRefreshAccess) {
     touchRecord(record);
     syncRecordToDb(record);
-    saveIndex();
   }
 
   const range = req.headers.range;
@@ -757,7 +953,6 @@ app.get('/preview/:id', (req, res) => {
 
   touchRecord(record);
   syncRecordToDb(record);
-  saveIndex();
 
   const file = publicRecord(record, req);
   const kind = getPreviewKind(file);

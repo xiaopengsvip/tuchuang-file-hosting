@@ -2,7 +2,7 @@ import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { getClipboardUploadFiles, mergeUploadedResults, isPreviewableImage, buildFileFingerprint, shouldUseResumableUpload, getFileChunks } from './uploadHelpers.js';
 import { getFriendlyUploadError, getDirectViewUrl, getSameSitePreviewUrl } from './uploadUi.js';
 import { getPreviewKind, buildPreviewUrl } from './previewPolicy.js';
-import { buildFeedSettingsPayload, getFeedBadge, normalizeNoteDraft, isVideoFile, buildUploadFeedPreference } from './contentPlatformUi.js';
+import { buildFeedSettingsPayload, getFeedBadge, normalizeNoteDraft, isVideoFile, buildUploadFeedPreference, buildFeedBatchPayload } from './contentPlatformUi.js';
 
 const API_BASE = '';
 const DEFAULT_MAX_FILE_MB = 1024;
@@ -41,6 +41,19 @@ function formatDateTime(iso) {
   }).replace(/\//g, '-');
 }
 
+function formatCompactDateTime(iso) {
+  if (!iso) return '未知';
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return '未知';
+  return d.toLocaleString('zh-CN', {
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false
+  }).replace(/\//g, '-');
+}
+
 function accessCountText(file = {}) {
   return `${Number(file.accessCount || 0).toLocaleString('zh-CN')} 次访问`;
 }
@@ -59,9 +72,141 @@ function getFileTypeIcon(mimeType) {
   return '📁';
 }
 
-function getFileExt(name) {
-  const parts = name.split('.');
+function getFileExt(name = '') {
+  const parts = String(name || '').split('.');
   return parts.length > 1 ? parts.pop().toUpperCase() : '';
+}
+
+function compactMiddle(input = '', maxLength = 72) {
+  const text = String(input || '');
+  if (text.length <= maxLength) return text;
+  const keepStart = Math.max(18, Math.floor(maxLength * 0.52));
+  const keepEnd = Math.max(12, maxLength - keepStart - 1);
+  return `${text.slice(0, keepStart)}…${text.slice(-keepEnd)}`;
+}
+
+function appendQueryParam(url = '', key, value) {
+  if (!url) return '';
+  return `${url}${url.includes('?') ? '&' : '?'}${encodeURIComponent(key)}=${encodeURIComponent(value)}`;
+}
+
+function sortFilesForView(files = [], sort = 'latest') {
+  const timeValue = (value) => {
+    const ms = value ? new Date(value).getTime() : 0;
+    return Number.isFinite(ms) ? ms : 0;
+  };
+  const recommendedRank = (file = {}) => {
+    if (file.allowFeed && file.feedStatus === 'approved' && file.visibility === 'public') return 0;
+    if (file.allowFeed) return 1;
+    return 2;
+  };
+  const list = Array.isArray(files) ? [...files] : [];
+  const comparators = {
+    latest: (a, b) => timeValue(b.uploadTime) - timeValue(a.uploadTime),
+    access: (a, b) => Number(b.accessCount || 0) - Number(a.accessCount || 0) || timeValue(b.uploadTime) - timeValue(a.uploadTime),
+    expiring: (a, b) => {
+      const aExpires = timeValue(a.expiresAt) || Number.POSITIVE_INFINITY;
+      const bExpires = timeValue(b.expiresAt) || Number.POSITIVE_INFINITY;
+      return aExpires - bExpires || timeValue(b.uploadTime) - timeValue(a.uploadTime);
+    },
+    largest: (a, b) => Number(b.size || 0) - Number(a.size || 0) || timeValue(b.uploadTime) - timeValue(a.uploadTime),
+    recommended: (a, b) => recommendedRank(a) - recommendedRank(b) || timeValue(b.uploadTime) - timeValue(a.uploadTime),
+  };
+  return list.sort(comparators[sort] || comparators.latest);
+}
+
+function videoElementFromPreview(event) {
+  return event.currentTarget?.querySelector?.('video.hover-preview-video') || null;
+}
+
+function handleVideoPreviewEnter(event) {
+  const video = videoElementFromPreview(event);
+  if (!video) return;
+  video.muted = true;
+  video.playsInline = true;
+  video.dataset.hoverPreview = 'playing';
+  const playPromise = video.play();
+  if (playPromise?.catch) playPromise.catch(() => {});
+}
+
+function handleVideoPreviewLeave(event) {
+  const video = videoElementFromPreview(event);
+  if (!video) return;
+  video.dataset.hoverPreview = 'paused';
+  video.pause();
+  try {
+    if (Number.isFinite(video.duration) && video.duration > 0) video.currentTime = 0;
+  } catch (e) {}
+}
+
+function getMorePanelProfile(file = {}, previewKind = 'generic') {
+  const ext = getFileExt(file.originalName || file.filename || 'FILE') || 'FILE';
+  const profiles = {
+    image: {
+      className: 'image',
+      icon: '🖼️',
+      eyebrow: 'IMAGE VIEW',
+      title: '原图视角',
+      description: '适合看细节、复制 Markdown 图片语法，或打开未压缩原始图片。',
+      previewAction: '大图预览',
+      accent: ext
+    },
+    video: {
+      className: 'video',
+      icon: '🎬',
+      eyebrow: 'VIDEO VIEW',
+      title: '播放视角',
+      description: '适合站内播放、悬停预览和推荐区管理，保留原视频清晰度。',
+      previewAction: '站内播放',
+      accent: ext
+    },
+    audio: {
+      className: 'audio',
+      icon: '🎧',
+      eyebrow: 'AUDIO VIEW',
+      title: '音频视角',
+      description: '适合快速试听、复制分享链接，或打开浏览器原生音频控件。',
+      previewAction: '试听音频',
+      accent: ext
+    },
+    pdf: {
+      className: 'document',
+      icon: '📕',
+      eyebrow: 'PDF VIEW',
+      title: '文档视角',
+      description: '适合在站内翻阅 PDF，同时保留原文件打开和下载入口。',
+      previewAction: '预览文档',
+      accent: ext
+    },
+    office: {
+      className: 'document',
+      icon: '📊',
+      eyebrow: 'OFFICE VIEW',
+      title: '表格/文档视角',
+      description: '适合通过 Office 预览器查看内容，也可以直接打开原始文件。',
+      previewAction: '预览文档',
+      accent: ext
+    },
+    text: {
+      className: 'text',
+      icon: '📝',
+      eyebrow: 'TEXT VIEW',
+      title: '文本视角',
+      description: '适合查看代码、日志或文本片段，预览内容会进行安全转义。',
+      previewAction: '查看文本',
+      accent: ext
+    },
+    generic: {
+      className: 'generic',
+      icon: '📦',
+      eyebrow: 'FILE VIEW',
+      title: '文件视角',
+      description: '该类型以原文件为主，适合复制链接、打开或下载保存。',
+      previewAction: '查看文件',
+      accent: ext
+    }
+  };
+  return profiles[previewKind] || profiles.generic;
 }
 
 // Toast component
@@ -78,8 +223,16 @@ function ToastContainer({ toasts }) {
 function FileLifecycleMeta({ file, compact = false }) {
   if (!file) return null;
   const idleDays = file.expireAfterIdleDays || DEFAULT_EXPIRE_AFTER_IDLE_DAYS;
+  if (compact) {
+    return (
+      <div className="lifecycle-meta compact" title={`最近访问：${formatDateTime(file.lastAccessTime)}；访问或预览会自动向后延期 ${idleDays} 天`}>
+        <span>👁 {accessCountText(file)}</span>
+        <span>⏳ {formatCompactDateTime(file.expiresAt)} 过期</span>
+      </div>
+    );
+  }
   return (
-    <div className={`lifecycle-meta ${compact ? 'compact' : ''}`}>
+    <div className="lifecycle-meta">
       <span>👁 {accessCountText(file)}</span>
       <span>⏰ 过期：{formatDateTime(file.expiresAt)}</span>
       <span>🕘 最近访问：{formatDateTime(file.lastAccessTime)}</span>
@@ -88,7 +241,7 @@ function FileLifecycleMeta({ file, compact = false }) {
   );
 }
 
-function PreviewModal({ file, onClose, onCopy, onDelete, onOpenExternal }) {
+function PreviewModal({ file, onClose, onCopy, onDelete, onOpenExternal, adminMode = false }) {
   if (!file) return null;
 
   const sameSitePreviewUrl = getSameSitePreviewUrl(file, API_BASE) || getDirectViewUrl(file, API_BASE);
@@ -97,28 +250,112 @@ function PreviewModal({ file, onClose, onCopy, onDelete, onOpenExternal }) {
   const originalUrl = file.url || file.directUrl || file.shortUrl || externalPreviewUrl;
   const kind = getPreviewKind(file);
   const title = file.originalName || file.filename || '文件预览';
+  const nativeMediaUrl = ['image', 'video', 'audio'].includes(kind)
+    ? appendQueryParam(
+      file.id ? `${API_BASE}/f/${encodeURIComponent(file.id)}/${encodeURIComponent(title)}` : (buildPreviewUrl(file) || originalUrl),
+      'previewEmbed',
+      '1'
+    )
+    : '';
+  const displayTitle = compactMiddle(title, 76);
 
   return (
     <div className="modal-overlay" onClick={onClose} role="dialog" aria-modal="true" aria-label={`${title} 本站预览`}>
       <div className="modal-content modal-content-wide" onClick={e => e.stopPropagation()}>
         <div className="modal-toolbar">
           <div className="modal-title-block">
-            <div className="modal-filename" title={title}>{title}</div>
-            <div className="modal-subtitle">
-              默认本站查看 · {formatSize(file.size || 0)} · {accessCountText(file)} · 过期 {formatDateTime(file.expiresAt)} · 访问/预览自动延期
+            <div className="modal-filename" title={title}>{displayTitle}</div>
+            <div className="modal-subtitle modal-subtitle-chips">
+              <span>默认本站查看</span>
+              <span>{formatSize(file.size || 0)}</span>
+              <span>{accessCountText(file)}</span>
+              <span>过期 {formatCompactDateTime(file.expiresAt)}</span>
+              <span>访问/预览自动延期</span>
             </div>
           </div>
           <div className="modal-actions">
-            <button className="btn btn-copy" onClick={() => onCopy(file.shortUrl || file.url)}>🔗 复制短链</button>
+            <button className="btn btn-copy" onClick={() => onCopy(file.shortUrl || file.url)}>复制</button>
             <button className="btn btn-copy" onClick={() => onCopy(file.markdown || file.url)}>MD</button>
-            <button className="btn btn-open" onClick={() => onOpenExternal(file)}>↗ 跳转预览</button>
+            <button className="btn btn-open" onClick={() => onOpenExternal(file)}>预览</button>
             <button className="btn btn-open" onClick={() => window.open(originalUrl, '_blank', 'noopener,noreferrer')}>原文件</button>
-            <button className="btn btn-delete" onClick={() => { onDelete(file.id); onClose(); }}>🗑 删除</button>
+            {adminMode ? <button className="btn btn-delete" onClick={() => { onDelete(file.id, title); onClose(); }}>删除</button> : null}
             <button className="modal-close" onClick={onClose} aria-label="关闭预览">✕</button>
           </div>
         </div>
-        <iframe className="modal-preview-frame" src={previewUrl} title={title} />
+        {kind === 'image' ? (
+          <div className="modal-preview-stage modal-preview-image-stage">
+            <img className="modal-preview-image" src={nativeMediaUrl} alt={title} />
+          </div>
+        ) : kind === 'video' ? (
+          <div className="modal-preview-stage modal-preview-video-stage">
+            <video className="modal-preview-video" src={nativeMediaUrl} controls playsInline preload="metadata" />
+          </div>
+        ) : kind === 'audio' ? (
+          <div className="modal-preview-stage modal-preview-audio-stage">
+            <div className="modal-audio-card">
+              <div className="modal-audio-icon">🎵</div>
+              <div className="modal-audio-title" title={title}>{displayTitle}</div>
+              <audio className="modal-preview-audio" src={nativeMediaUrl} controls preload="metadata" />
+            </div>
+          </div>
+        ) : (
+          <iframe className="modal-preview-frame" src={previewUrl} title={title} />
+        )}
       </div>
+    </div>
+  );
+}
+
+function FileEditModal({ file, saving = false, onClose, onSave }) {
+  const [draft, setDraft] = useState({ title: '', description: '', tagsText: '' });
+
+  useEffect(() => {
+    if (!file) return;
+    setDraft({
+      title: file.title || file.originalName || file.filename || '',
+      description: file.description || '',
+      tagsText: Array.isArray(file.tags) ? file.tags.join(', ') : ''
+    });
+  }, [file]);
+
+  if (!file) return null;
+
+  const submit = (event) => {
+    event.preventDefault();
+    onSave({
+      title: draft.title.trim(),
+      description: draft.description.trim(),
+      tags: draft.tagsText.split(',').map(tag => tag.trim()).filter(Boolean).slice(0, 20),
+    });
+  };
+
+  return (
+    <div className="modal-overlay" onClick={onClose} role="dialog" aria-modal="true" aria-label="编辑视频信息">
+      <form className="edit-modal-content glass" onClick={e => e.stopPropagation()} onSubmit={submit}>
+        <div className="settings-header">
+          <div>
+            <div className="settings-title">编辑视频信息</div>
+            <div className="settings-subtitle" title={file.originalName || file.filename}>{compactMiddle(file.originalName || file.filename || '视频文件', 54)}</div>
+          </div>
+          <button type="button" className="modal-close settings-close" onClick={onClose} aria-label="关闭编辑">✕</button>
+        </div>
+        <label className="edit-field">
+          <span>显示标题</span>
+          <input className="settings-input" value={draft.title} maxLength={180} onChange={e => setDraft(prev => ({ ...prev, title: e.target.value }))} placeholder="例如 IMG_0385.MOV" />
+        </label>
+        <label className="edit-field">
+          <span>说明</span>
+          <textarea className="settings-input note-textarea" value={draft.description} maxLength={1000} onChange={e => setDraft(prev => ({ ...prev, description: e.target.value }))} placeholder="可选：视频说明、用途或备注" />
+        </label>
+        <label className="edit-field">
+          <span>标签</span>
+          <input className="settings-input" value={draft.tagsText} onChange={e => setDraft(prev => ({ ...prev, tagsText: e.target.value }))} placeholder="用英文逗号分隔，例如 会议, 素材" />
+        </label>
+        <div className="edit-modal-actions">
+          <button type="button" className="btn btn-open" onClick={onClose} disabled={saving}>取消</button>
+          <button type="submit" className="btn btn-copy" disabled={saving}>{saving ? '保存中...' : '保存信息'}</button>
+        </div>
+      </form>
     </div>
   );
 }
@@ -271,25 +508,27 @@ function UploadResults({ files, onCopy, onClear, onOpenSiteView, onOpenDirectVie
                 )}
               </div>
               <div className="upload-result-info">
-                <div className="upload-result-name" title={file.originalName || file.filename}>{file.originalName || file.filename}</div>
+                <div className="upload-result-topline">
+                  <div className="upload-result-name" title={file.originalName || file.filename}>{file.originalName || file.filename}</div>
+                  <span className="result-success-badge">已就绪</span>
+                </div>
                 <div className="upload-result-meta">
                   <span>{formatSize(file.size || 0)}</span>
                   <span>上传 {file.uploadDate || formatDate(file.uploadTime)}</span>
-                  <span>{accessCountText(file)}</span>
-                  <span>过期 {formatDateTime(file.expiresAt)}</span>
                 </div>
                 <FileLifecycleMeta file={file} compact />
                 {isVideoFile(file) && <div className={`feed-status-pill ${file.allowFeed && file.feedStatus === 'approved' ? 'active' : ''}`}>🎬 {getFeedBadge(file)}</div>}
-                <div className="link-row">
+                <div className="link-row compact-link-row">
+                  <span className="link-row-label">短链</span>
                   <input className="link-input" readOnly value={link || ''} onFocus={e => e.target.select()} />
-                  <button className="btn btn-copy" onClick={() => onCopy(link)}>复制链接</button>
+                  <button className="btn btn-copy" onClick={() => onCopy(link)}>复制</button>
                 </div>
                 <div className="upload-result-actions">
-                  <button className="btn btn-open" onClick={openResult}>👁 本站查看</button>
-                  <button className="btn btn-open" onClick={() => onOpenDirectView(file)}>↗ 跳转预览</button>
+                  <button className="btn btn-open" onClick={openResult}>👁 本站</button>
+                  <button className="btn btn-open" onClick={() => onOpenDirectView(file)}>↗ 预览</button>
                   <button className="btn btn-copy" onClick={() => onCopy(file.url)}>长链</button>
-                  <button className="btn btn-copy" onClick={() => onCopy(file.markdown || file.url)}>Markdown</button>
-                  <button className="btn btn-open" onClick={() => window.open(file.url || link, '_blank')}>↗ 原文件</button>
+                  <button className="btn btn-copy" onClick={() => onCopy(file.markdown || file.url)}>MD</button>
+                  <button className="btn btn-open" onClick={() => window.open(file.url || link, '_blank')}>原文件</button>
                 </div>
               </div>
             </article>
@@ -300,7 +539,24 @@ function UploadResults({ files, onCopy, onClear, onOpenSiteView, onOpenDirectVie
   );
 }
 
-function FeedSection({ videos, loading, onRefresh, onOpenSiteView, onOpenDirectView }) {
+function FeedSection({
+  videos,
+  loading,
+  adminMode,
+  feedManageItems,
+  feedManageSummary,
+  feedManageLoading,
+  feedManageStatus,
+  selectedFeedIds,
+  onRefresh,
+  onOpenSiteView,
+  onOpenDirectView,
+  onFetchFeedManage,
+  onSetFeedManageStatus,
+  onToggleFeedSelect,
+  onFeedBatchAction,
+}) {
+  const selectedCount = selectedFeedIds.length;
   return (
     <section className="content-panel glass feed-panel">
       <div className="panel-header">
@@ -310,6 +566,50 @@ function FeedSection({ videos, loading, onRefresh, onOpenSiteView, onOpenDirectV
         </div>
         <button className="btn btn-open" onClick={onRefresh} disabled={loading}>{loading ? '刷新中...' : '刷新推荐'}</button>
       </div>
+      {adminMode ? (
+        <div className="feed-admin-panel">
+          <div className="feed-admin-header">
+            <div>
+              <div className="feed-admin-title">推荐区后台批量管理</div>
+              <div className="feed-admin-subtitle">
+                已推荐 {feedManageSummary.approved || 0} · 待审核 {feedManageSummary.pending || 0} · 已拒绝 {feedManageSummary.rejected || 0} · 未推荐 {feedManageSummary.hidden || 0}
+              </div>
+            </div>
+            <div className="feed-admin-actions">
+              <select className="feed-admin-select" value={feedManageStatus} onChange={(e) => onSetFeedManageStatus(e.target.value)}>
+                <option value="all">全部视频</option>
+                <option value="approved">推荐中</option>
+                <option value="pending">待审核</option>
+                <option value="hidden">未推荐</option>
+                <option value="rejected">已拒绝</option>
+              </select>
+              <button className="btn btn-open" onClick={onFetchFeedManage} disabled={feedManageLoading}>{feedManageLoading ? '加载中...' : '刷新后台'}</button>
+              <button className="btn btn-delete" onClick={() => onFeedBatchAction('clear-approved')} disabled={feedManageLoading || !(feedManageSummary.approved > 0)}>一键取消全部推荐</button>
+            </div>
+          </div>
+          <div className="feed-admin-batch-actions">
+            <button className="btn btn-copy" onClick={() => onFeedBatchAction('approve')} disabled={!selectedCount}>选中进推荐</button>
+            <button className="btn btn-open" onClick={() => onFeedBatchAction('hide')} disabled={!selectedCount}>选中取消推荐</button>
+            <button className="btn btn-delete" onClick={() => onFeedBatchAction('reject')} disabled={!selectedCount}>选中拒绝</button>
+            <span>已选 {selectedCount} 个视频</span>
+          </div>
+          {feedManageLoading ? <div className="settings-log-empty">正在加载推荐后台...</div> : null}
+          {!feedManageLoading && !feedManageItems.length ? <div className="settings-log-empty">当前筛选下暂无视频。</div> : null}
+          {!feedManageLoading && feedManageItems.length > 0 ? (
+            <div className="feed-admin-list">
+              {feedManageItems.map(item => (
+                <label key={item.id} className="feed-admin-item">
+                  <input type="checkbox" checked={selectedFeedIds.includes(item.id)} onChange={() => onToggleFeedSelect(item.id)} />
+                  <span className={`feed-status-pill ${item.allowFeed && item.feedStatus === 'approved' ? 'active' : ''}`}>{getFeedBadge(item)}</span>
+                  <span className="feed-admin-name" title={item.originalName || item.filename}>{item.title || item.originalName || item.filename}</span>
+                  <span className="feed-admin-meta">{formatSize(item.size || 0)} · {formatDate(item.uploadTime)}</span>
+                  <button type="button" className="btn btn-open" onClick={(e) => { e.preventDefault(); onOpenSiteView(item); }}>预览</button>
+                </label>
+              ))}
+            </div>
+          ) : null}
+        </div>
+      ) : null}
       {loading ? <div className="empty-state compact"><div className="loading-spinner" /><div className="empty-text">加载视频推荐...</div></div> : null}
       {!loading && !videos.length ? (
         <div className="empty-state compact">
@@ -344,39 +644,80 @@ function FeedSection({ videos, loading, onRefresh, onOpenSiteView, onOpenDirectV
   );
 }
 
-function NotesSection({ notes, loading, adminMode, noteDraft, setNoteDraft, onCreateNote, onRefresh }) {
+function NotesSection({
+  notes,
+  loading,
+  adminMode,
+  noteDraft,
+  setNoteDraft,
+  editingNoteId,
+  noteHistories,
+  historyLoadingId,
+  onSaveNote,
+  onCancelEdit,
+  onEditNote,
+  onDeleteNote,
+  onShowHistory,
+  onRefresh
+}) {
+  const editing = Boolean(editingNoteId);
   return (
     <section className="content-panel glass notes-panel">
       <div className="panel-header">
         <div>
           <div className="section-title">📝 笔记</div>
-          <div className="section-subtitle">MVP 支持公开/私有 Markdown 笔记；发布和查看私有笔记需要管理员 Token。</div>
+          <div className="section-subtitle">支持公开/私有笔记、重编辑、软删除和历史版本；发布/编辑/删除需要管理员 Token。</div>
         </div>
         <button className="btn btn-open" onClick={onRefresh} disabled={loading}>{loading ? '刷新中...' : '刷新笔记'}</button>
       </div>
       {adminMode ? (
-        <div className="note-editor">
+        <div className={`note-editor ${editing ? 'editing' : ''}`}>
+          <div className="note-editor-mode">{editing ? '正在编辑已有笔记，保存后会自动写入历史版本' : '新建笔记'}</div>
           <input className="settings-input" placeholder="笔记标题" value={noteDraft.title} onChange={e => setNoteDraft(prev => ({ ...prev, title: e.target.value }))} />
           <textarea className="settings-input note-textarea" placeholder="写一点说明、剪辑想法或文件备注，支持 Markdown" value={noteDraft.content} onChange={e => setNoteDraft(prev => ({ ...prev, content: e.target.value }))} />
           <input className="settings-input" placeholder="标签，用英文逗号分隔" value={noteDraft.tagsText} onChange={e => setNoteDraft(prev => ({ ...prev, tagsText: e.target.value }))} />
           <label className="note-public-toggle"><input type="checkbox" checked={noteDraft.publicNote} onChange={e => setNoteDraft(prev => ({ ...prev, publicNote: e.target.checked }))} /> 公开展示</label>
-          <button className="btn btn-copy" onClick={onCreateNote}>发布笔记</button>
+          <div className="note-editor-actions">
+            <button className="btn btn-copy" onClick={onSaveNote}>{editing ? '保存修改' : '发布笔记'}</button>
+            {editing ? <button className="btn btn-open" onClick={onCancelEdit}>取消编辑</button> : null}
+          </div>
         </div>
       ) : (
-        <div className="settings-log-empty">保存管理员 Token 后可以创建私有/公开笔记。</div>
+        <div className="settings-log-empty">保存管理员 Token 后可以创建、编辑、删除并查看笔记历史。</div>
       )}
       {loading ? <div className="empty-state compact"><div className="loading-spinner" /><div className="empty-text">加载笔记...</div></div> : null}
       {!loading && !notes.length ? <div className="empty-state compact"><div className="empty-icon">📒</div><div className="empty-text">暂无笔记</div></div> : null}
       {!loading && notes.length ? (
         <div className="note-list">
-          {notes.map(note => (
-            <article key={note.id} className="note-card">
-              <div className="note-card-top"><strong>{note.title || '未命名笔记'}</strong><span>{note.visibility === 'public' ? '公开' : '私有'}</span></div>
-              <p>{note.content}</p>
-              {Array.isArray(note.tags) && note.tags.length ? <div className="feed-tags">{note.tags.map(tag => <span key={tag}>{tag}</span>)}</div> : null}
-              <div className="feed-meta">{formatDate(note.createdAt)}</div>
-            </article>
-          ))}
+          {notes.map(note => {
+            const history = noteHistories[note.id] || [];
+            return (
+              <article key={note.id} className="note-card">
+                <div className="note-card-top"><strong>{note.title || '未命名笔记'}</strong><span>{note.visibility === 'public' ? '公开' : '私有'}</span></div>
+                <p>{note.content}</p>
+                {Array.isArray(note.tags) && note.tags.length ? <div className="feed-tags">{note.tags.map(tag => <span key={tag}>{tag}</span>)}</div> : null}
+                <div className="feed-meta">创建 {formatDate(note.createdAt)} · 更新 {formatDate(note.updatedAt || note.createdAt)}</div>
+                {adminMode ? (
+                  <div className="note-actions">
+                    <button className="btn btn-copy" onClick={() => onEditNote(note)}>重编辑</button>
+                    <button className="btn btn-open" onClick={() => onShowHistory(note.id)} disabled={historyLoadingId === note.id}>{historyLoadingId === note.id ? '加载历史...' : `历史${history.length ? `(${history.length})` : ''}`}</button>
+                    <button className="btn btn-delete" onClick={() => onDeleteNote(note.id)}>删除</button>
+                  </div>
+                ) : null}
+                {history.length > 0 ? (
+                  <div className="note-history-list">
+                    {history.map(item => (
+                      <div key={item.id || `${note.id}-${item.revision}`} className={`note-history-item ${item.action}`}>
+                        <div><strong>版本 {item.revision}</strong> · {item.action === 'created' ? '创建' : item.action === 'deleted' ? '删除' : '修改'} · {formatDateTime(item.createdAt)}</div>
+                        <div className="note-history-title">{item.title || '未命名笔记'} · {item.visibility === 'public' ? '公开' : '私有'}</div>
+                        <div className="note-history-content">{item.content}</div>
+                      </div>
+                    ))}
+                  </div>
+                ) : null}
+              </article>
+            );
+          })}
         </div>
       ) : null}
     </section>
@@ -390,6 +731,7 @@ export default function App() {
   const [pagination, setPagination] = useState({ page: 1, totalPages: 1, total: 0 });
   const [search, setSearch] = useState('');
   const [filter, setFilter] = useState('');
+  const [sort, setSort] = useState('latest');
   const [page, setPage] = useState(1);
   const [dragging, setDragging] = useState(false);
   const [uploading, setUploading] = useState(false);
@@ -397,10 +739,14 @@ export default function App() {
   const [uploadStatusText, setUploadStatusText] = useState('');
   const [uploadError, setUploadError] = useState(null);
   const [uploadFeedRequested, setUploadFeedRequested] = useState(false);
+  const [uploadPanelOpen, setUploadPanelOpen] = useState(false);
   const [toasts, setToasts] = useState([]);
   const [uploadResults, setUploadResults] = useState([]);
   const [previewFile, setPreviewFile] = useState(null);
   const [copiedUrl, setCopiedUrl] = useState('');
+  const [openMoreId, setOpenMoreId] = useState('');
+  const [editingFile, setEditingFile] = useState(null);
+  const [editSaving, setEditSaving] = useState(false);
   const [loading, setLoading] = useState(false);
   const [adminToken, setAdminToken] = useState(() => localStorage.getItem('tuchuang_admin_token') || '');
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -411,14 +757,23 @@ export default function App() {
   const [activeView, setActiveView] = useState('files');
   const [feedVideos, setFeedVideos] = useState([]);
   const [feedLoading, setFeedLoading] = useState(false);
+  const [feedManageItems, setFeedManageItems] = useState([]);
+  const [feedManageSummary, setFeedManageSummary] = useState({ totalVideos: 0, approved: 0, pending: 0, rejected: 0, hidden: 0 });
+  const [feedManageLoading, setFeedManageLoading] = useState(false);
+  const [feedManageStatus, setFeedManageStatus] = useState('all');
+  const [selectedFeedIds, setSelectedFeedIds] = useState([]);
   const [notes, setNotes] = useState([]);
   const [notesLoading, setNotesLoading] = useState(false);
   const [noteDraft, setNoteDraft] = useState({ title: '', content: '', tagsText: '', publicNote: false });
+  const [editingNoteId, setEditingNoteId] = useState('');
+  const [noteHistories, setNoteHistories] = useState({});
+  const [historyLoadingId, setHistoryLoadingId] = useState('');
   const fileInputRef = useRef(null);
   const searchTimerRef = useRef(null);
   const maxFileMB = publicConfig.maxFileMB || stats.maxFileMB || DEFAULT_MAX_FILE_MB;
   const expireAfterIdleDays = publicConfig.expireAfterIdleDays || stats.expireAfterIdleDays || DEFAULT_EXPIRE_AFTER_IDLE_DAYS;
   const maxFileBytes = maxFileMB * 1024 * 1024;
+  const uploadLimitText = maxFileMB >= 1024 ? `${Number(maxFileMB / 1024).toLocaleString('zh-CN')}GB` : `${maxFileMB}MB`;
   const uploadTier = publicConfig.uploadTier || stats.uploadTier || 'public';
   const adminMode = uploadTier === 'admin';
   const authHeaders = useCallback((extra = {}) => ({ ...(adminToken ? { 'X-Admin-Token': adminToken } : {}), ...extra }), [adminToken]);
@@ -471,7 +826,7 @@ export default function App() {
   const fetchFiles = useCallback(async () => {
     setLoading(true);
     try {
-      const params = new URLSearchParams({ page, limit: 30, search, type: filter });
+      const params = new URLSearchParams({ page, limit: 200, search, type: filter, sort });
       const res = await fetch(`${API_BASE}/api/files?${params}`, { headers: authHeaders() });
       if (res.status === 401) {
         setNeedToken(true);
@@ -481,7 +836,7 @@ export default function App() {
       const data = await res.json();
       if (data.success) {
         setNeedToken(false);
-        setFiles(data.files);
+        setFiles(sortFilesForView(data.files, sort));
         setPagination(data.pagination);
       }
     } catch (e) {
@@ -489,7 +844,7 @@ export default function App() {
     } finally {
       setLoading(false);
     }
-  }, [page, search, filter, authHeaders, addToast]);
+  }, [page, search, filter, sort, authHeaders, addToast]);
 
   const fetchStats = useCallback(async () => {
     try {
@@ -512,6 +867,34 @@ export default function App() {
       setFeedLoading(false);
     }
   }, [addToast]);
+
+  const fetchFeedManage = useCallback(async () => {
+    if (!adminToken) {
+      setFeedManageItems([]);
+      setSelectedFeedIds([]);
+      return;
+    }
+    setFeedManageLoading(true);
+    try {
+      const params = new URLSearchParams({ limit: 80, status: feedManageStatus });
+      const res = await fetch(`${API_BASE}/api/admin/feed/videos?${params}`, { headers: authHeaders() });
+      const data = await res.json().catch(() => ({}));
+      if (res.status === 401) {
+        setNeedToken(true);
+        addToast('管理员 Token 无效，无法加载推荐后台', 'error');
+        return;
+      }
+      if (!res.ok || data.success === false) throw new Error(data.error || `HTTP ${res.status}`);
+      const items = Array.isArray(data.files) ? data.files : [];
+      setFeedManageItems(items);
+      setFeedManageSummary(data.summary || { totalVideos: 0, approved: 0, pending: 0, rejected: 0, hidden: 0 });
+      setSelectedFeedIds(prev => prev.filter(id => items.some(item => item.id === id)));
+    } catch (e) {
+      addToast(`推荐后台加载失败：${e.message || e}`, 'error');
+    } finally {
+      setFeedManageLoading(false);
+    }
+  }, [adminToken, authHeaders, feedManageStatus, addToast]);
 
   const fetchNotes = useCallback(async () => {
     setNotesLoading(true);
@@ -574,12 +957,23 @@ export default function App() {
   useEffect(() => { fetchFiles(); }, [fetchFiles]);
   useEffect(() => { fetchStats(); }, [fetchStats]);
   useEffect(() => {
-    if (activeView === 'feed') fetchFeedVideos();
+    if (activeView === 'feed') {
+      fetchFeedVideos();
+      if (adminMode) fetchFeedManage();
+    }
     if (activeView === 'notes') fetchNotes();
-  }, [activeView, fetchFeedVideos, fetchNotes]);
+  }, [activeView, adminMode, fetchFeedVideos, fetchFeedManage, fetchNotes]);
   useEffect(() => {
     if (settingsOpen && adminToken) fetchUploadLogs();
   }, [settingsOpen, adminToken, fetchUploadLogs]);
+  useEffect(() => {
+    if (!openMoreId) return undefined;
+    const handleKeyDown = (event) => {
+      if (event.key === 'Escape') setOpenMoreId('');
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [openMoreId]);
 
   const handleSearch = (value) => {
     clearTimeout(searchTimerRef.current);
@@ -592,6 +986,7 @@ export default function App() {
   const handleUpload = useCallback(async (fileList) => {
     if (!fileList || fileList.length === 0) return;
     const selectedFiles = Array.from(fileList);
+    setUploadPanelOpen(true);
     const uploadFeedPreference = buildUploadFeedPreference(uploadFeedRequested);
     const oversized = selectedFiles.filter(file => file.size > maxFileBytes);
     if (oversized.length > 0) {
@@ -774,6 +1169,7 @@ export default function App() {
       const files = getClipboardUploadFiles(event.clipboardData);
       if (!files.length) return;
       event.preventDefault();
+      setUploadPanelOpen(true);
       addToast(`检测到剪贴板文件，开始上传 ${files.length} 个`, 'info');
       handleUpload(files);
     };
@@ -782,9 +1178,40 @@ export default function App() {
     return () => window.removeEventListener('paste', onPaste);
   }, [addToast, handleUpload]);
 
+  useEffect(() => {
+    const hasFileDrag = (event) => Array.from(event.dataTransfer?.types || []).includes('Files');
+    const onDragOver = (event) => {
+      if (!hasFileDrag(event)) return;
+      event.preventDefault();
+      setDragging(true);
+    };
+    const onDrop = (event) => {
+      if (!hasFileDrag(event)) return;
+      event.preventDefault();
+      setDragging(false);
+      setUploadPanelOpen(true);
+      handleUpload(event.dataTransfer.files);
+    };
+    const onDragLeave = (event) => {
+      if (event.clientX <= 0 || event.clientY <= 0 || event.clientX >= window.innerWidth || event.clientY >= window.innerHeight) {
+        setDragging(false);
+      }
+    };
+    window.addEventListener('dragover', onDragOver);
+    window.addEventListener('drop', onDrop);
+    window.addEventListener('dragleave', onDragLeave);
+    return () => {
+      window.removeEventListener('dragover', onDragOver);
+      window.removeEventListener('drop', onDrop);
+      window.removeEventListener('dragleave', onDragLeave);
+    };
+  }, [handleUpload]);
+
   const handleDrop = (e) => {
     e.preventDefault();
+    e.stopPropagation?.();
     setDragging(false);
+    setUploadPanelOpen(true);
     handleUpload(e.dataTransfer.files);
   };
 
@@ -831,7 +1258,9 @@ export default function App() {
     window.setTimeout(() => refreshFileRecord(file.id || file.filename), 1200);
   }, [addToast, refreshFileRecord]);
 
-  const handleDelete = async (id) => {
+  const handleDelete = async (id, name = '') => {
+    const confirmed = typeof window === 'undefined' || window.confirm(`确定要删除该文件吗？\n${name ? `文件：${name}\n` : ''}删除后可能无法恢复。`);
+    if (!confirmed) return;
     try {
       const res = await fetch(`${API_BASE}/api/files/${id}`, { method: 'DELETE', headers: authHeaders() });
       if (res.status === 401) {
@@ -839,10 +1268,14 @@ export default function App() {
         addToast('请输入管理员 Token 后再删除', 'error');
         return;
       }
+      setOpenMoreId('');
       addToast('文件已删除', 'info');
       fetchFiles();
       fetchStats();
-      if (activeView === 'feed') fetchFeedVideos();
+      if (activeView === 'feed') {
+        fetchFeedVideos();
+        fetchFeedManage();
+      }
     } catch (e) {
       addToast('删除失败', 'error');
     }
@@ -876,27 +1309,74 @@ export default function App() {
       setFiles(prev => prev.map(item => (item.id === updated.id ? { ...item, ...updated } : item)));
       setUploadResults(prev => prev.map(item => (item.id === updated.id ? { ...item, ...updated } : item)));
       setPreviewFile(prev => (prev && prev.id === updated.id ? { ...prev, ...updated } : prev));
+      setOpenMoreId('');
       addToast(enable ? '已允许该视频进入推荐区' : '已从推荐区隐藏', 'success');
       fetchStats();
       fetchFeedVideos();
+      fetchFeedManage();
     } catch (e) {
       addToast(`推荐区更新失败：${e.message || e}`, 'error');
     }
   };
 
-  const handleCreateNote = async () => {
+  const handleOpenEditFile = (file) => {
     if (!adminToken) {
       setNeedToken(true);
-      addToast('保存管理员 Token 后才能发布笔记', 'error');
+      addToast('保存管理员 Token 后才能编辑视频信息', 'error');
       return;
     }
-    const payload = normalizeNoteDraft(noteDraft);
-    if (!payload.title || !payload.content) {
-      addToast('请填写笔记标题和内容', 'error');
+    setOpenMoreId('');
+    setEditingFile(file);
+  };
+
+  const handleSaveFileInfo = async (draft) => {
+    if (!editingFile) return;
+    setEditSaving(true);
+    try {
+      const res = await fetch(`${API_BASE}/api/files/${encodeURIComponent(editingFile.id)}/feed`, {
+        method: 'PATCH',
+        headers: authHeaders({ 'Content-Type': 'application/json' }),
+        body: JSON.stringify(draft)
+      });
+      const data = await res.json().catch(() => ({}));
+      if (res.status === 401) {
+        setNeedToken(true);
+        addToast('管理员 Token 无效，无法保存信息', 'error');
+        return;
+      }
+      if (!res.ok || data.success === false) throw new Error(data.error || `HTTP ${res.status}`);
+      const updated = data.file;
+      setFiles(prev => prev.map(item => (item.id === updated.id ? { ...item, ...updated } : item)));
+      setUploadResults(prev => prev.map(item => (item.id === updated.id ? { ...item, ...updated } : item)));
+      setPreviewFile(prev => (prev && prev.id === updated.id ? { ...prev, ...updated } : prev));
+      setEditingFile(null);
+      addToast('视频信息已保存', 'success');
+      fetchFeedVideos();
+      fetchFeedManage();
+    } catch (e) {
+      addToast(`保存信息失败：${e.message || e}`, 'error');
+    } finally {
+      setEditSaving(false);
+    }
+  };
+
+  const handleToggleFeedSelect = (id) => {
+    setSelectedFeedIds(prev => prev.includes(id) ? prev.filter(item => item !== id) : [...prev, id]);
+  };
+
+  const handleFeedBatchAction = async (action) => {
+    if (!adminToken) {
+      setNeedToken(true);
+      addToast('保存管理员 Token 后才能批量管理推荐区', 'error');
+      return;
+    }
+    const payload = buildFeedBatchPayload(action, selectedFeedIds);
+    if (payload.action !== 'clear-approved' && (!payload.ids || payload.ids.length === 0)) {
+      addToast('请先选择要批量处理的视频', 'error');
       return;
     }
     try {
-      const res = await fetch(`${API_BASE}/api/notes`, {
+      const res = await fetch(`${API_BASE}/api/admin/feed/batch`, {
         method: 'POST',
         headers: authHeaders({ 'Content-Type': 'application/json' }),
         body: JSON.stringify(payload)
@@ -904,15 +1384,126 @@ export default function App() {
       const data = await res.json().catch(() => ({}));
       if (res.status === 401) {
         setNeedToken(true);
-        addToast('管理员 Token 无效，无法发布笔记', 'error');
+        addToast('管理员 Token 无效，无法批量管理推荐区', 'error');
         return;
       }
       if (!res.ok || data.success === false) throw new Error(data.error || `HTTP ${res.status}`);
-      setNoteDraft({ title: '', content: '', tagsText: '', publicNote: false });
-      addToast('笔记已发布', 'success');
+      setSelectedFeedIds([]);
+      setFeedManageSummary(data.summary || feedManageSummary);
+      addToast(payload.action === 'clear-approved' ? `已一键取消 ${data.updated || 0} 个推荐视频` : `已批量更新 ${data.updated || 0} 个视频`, 'success');
+      fetchFeedVideos();
+      fetchFeedManage();
+      fetchFiles();
+      fetchStats();
+    } catch (e) {
+      addToast(`批量管理失败：${e.message || e}`, 'error');
+    }
+  };
+
+  const resetNoteEditor = useCallback(() => {
+    setEditingNoteId('');
+    setNoteDraft({ title: '', content: '', tagsText: '', publicNote: false });
+  }, []);
+
+  const handleSaveNote = async () => {
+    if (!adminToken) {
+      setNeedToken(true);
+      addToast('保存管理员 Token 后才能保存笔记', 'error');
+      return;
+    }
+    const payload = normalizeNoteDraft(noteDraft);
+    if (!payload.title || !payload.content) {
+      addToast('请填写笔记标题和内容', 'error');
+      return;
+    }
+    const editing = Boolean(editingNoteId);
+    try {
+      const res = await fetch(`${API_BASE}/api/notes${editing ? `/${encodeURIComponent(editingNoteId)}` : ''}`, {
+        method: editing ? 'PATCH' : 'POST',
+        headers: authHeaders({ 'Content-Type': 'application/json' }),
+        body: JSON.stringify(payload)
+      });
+      const data = await res.json().catch(() => ({}));
+      if (res.status === 401) {
+        setNeedToken(true);
+        addToast('管理员 Token 无效，无法保存笔记', 'error');
+        return;
+      }
+      if (!res.ok || data.success === false) throw new Error(data.error || `HTTP ${res.status}`);
+      const saved = data.note;
+      resetNoteEditor();
+      addToast(editing ? '笔记已保存，历史版本已记录' : '笔记已发布', 'success');
+      fetchNotes();
+      if (editing && saved?.id) setNoteHistories(prev => ({ ...prev, [saved.id]: [] }));
+    } catch (e) {
+      addToast(`保存笔记失败：${e.message || e}`, 'error');
+    }
+  };
+
+  const handleEditNote = (note) => {
+    setEditingNoteId(note.id);
+    setNoteDraft({
+      title: note.title || '',
+      content: note.content || '',
+      tagsText: Array.isArray(note.tags) ? note.tags.join(', ') : '',
+      publicNote: note.visibility === 'public'
+    });
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  };
+
+  const handleDeleteNote = async (id) => {
+    if (!adminToken) {
+      setNeedToken(true);
+      addToast('保存管理员 Token 后才能删除笔记', 'error');
+      return;
+    }
+    try {
+      const res = await fetch(`${API_BASE}/api/notes/${encodeURIComponent(id)}`, { method: 'DELETE', headers: authHeaders() });
+      const data = await res.json().catch(() => ({}));
+      if (res.status === 401) {
+        setNeedToken(true);
+        addToast('管理员 Token 无效，无法删除笔记', 'error');
+        return;
+      }
+      if (!res.ok || data.success === false) throw new Error(data.error || `HTTP ${res.status}`);
+      if (editingNoteId === id) resetNoteEditor();
+      setNoteHistories(prev => {
+        const next = { ...prev };
+        delete next[id];
+        return next;
+      });
+      addToast('笔记已删除，删除动作已写入历史', 'success');
       fetchNotes();
     } catch (e) {
-      addToast(`发布笔记失败：${e.message || e}`, 'error');
+      addToast(`删除笔记失败：${e.message || e}`, 'error');
+    }
+  };
+
+  const handleShowNoteHistory = async (id) => {
+    if (!adminToken) {
+      setNeedToken(true);
+      addToast('保存管理员 Token 后才能查看笔记历史', 'error');
+      return;
+    }
+    if (noteHistories[id]?.length) {
+      setNoteHistories(prev => ({ ...prev, [id]: [] }));
+      return;
+    }
+    setHistoryLoadingId(id);
+    try {
+      const res = await fetch(`${API_BASE}/api/notes/${encodeURIComponent(id)}/history`, { headers: authHeaders() });
+      const data = await res.json().catch(() => ({}));
+      if (res.status === 401) {
+        setNeedToken(true);
+        addToast('管理员 Token 无效，无法查看笔记历史', 'error');
+        return;
+      }
+      if (!res.ok || data.success === false) throw new Error(data.error || `HTTP ${res.status}`);
+      setNoteHistories(prev => ({ ...prev, [id]: Array.isArray(data.history) ? data.history : [] }));
+    } catch (e) {
+      addToast(`加载笔记历史失败：${e.message || e}`, 'error');
+    } finally {
+      setHistoryLoadingId('');
     }
   };
 
@@ -937,42 +1528,52 @@ export default function App() {
     setAdminToken('');
     setNeedToken(false);
     setUploadLogs([]);
+    setFeedManageItems([]);
+    setSelectedFeedIds([]);
+    setEditingNoteId('');
+    setNoteHistories({});
+    setHistoryLoadingId('');
     setLogsError('');
     addToast('已清除管理员 Token，恢复访客模式', 'info');
   };
 
   return (
-    <div className="app-container">
+    <div className="app-container" onClick={() => { if (openMoreId) setOpenMoreId(''); }}>
       <ToastContainer toasts={toasts} />
 
       {/* Header */}
-      <header className="header glass">
+      <header className="header glass hero-shell">
         <div className="header-brand">
-          <div className="header-logo">☁️</div>
-          <div>
-            <div className="header-title">图床</div>
-            <div className="header-subtitle">Public 1GB/file · Admin 10GB/file · Original Upload · 7-day idle expiry</div>
+          <div className="header-logo" aria-hidden="true">☁️</div>
+          <div className="header-copy">
+            <div className="header-kicker">ALLAPPLE FILE CLOUD</div>
+            <div className="header-title-row">
+              <div className="header-title">图床运营台</div>
+              <span className={`mode-badge ${adminMode ? 'admin' : ''}`}>{adminMode ? '管理员模式' : '访客模式'}</span>
+            </div>
+            <div className="header-subtitle">原图原视频直传 · 大文件断点续传 · 访问自动续期 {expireAfterIdleDays} 天</div>
           </div>
         </div>
         <div className="header-right">
-          <div className="header-stats">
-            <div className="stat-item">
-              <div className="stat-value">{stats.totalFiles}</div>
-              <div className="stat-label">文件</div>
+          <nav className="header-nav" aria-label="内容视图切换">
+            {[
+              { key: 'files', label: '文件上传' },
+              { key: 'feed', label: `视频推荐${stats.feedVideoCount ? ` ${stats.feedVideoCount}` : ''}` },
+              { key: 'notes', label: '笔记' },
+            ].map(item => (
+              <button key={item.key} className={`view-tab header-tab ${activeView === item.key ? 'active' : ''}`} onClick={() => setActiveView(item.key)}>
+                {item.label}
+              </button>
+            ))}
+          </nav>
+          {adminMode && (
+            <div className="header-stats compact-stats" aria-label="当前图床统计">
+              <span>{stats.totalFiles} 文件</span>
+              <span>{formatSize(stats.totalSize)}</span>
+              <span>{stats.imageCount} 图片</span>
+              <span>{Number(stats.totalAccessCount || 0).toLocaleString('zh-CN')} 访问</span>
             </div>
-            <div className="stat-item">
-              <div className="stat-value">{formatSize(stats.totalSize)}</div>
-              <div className="stat-label">存储</div>
-            </div>
-            <div className="stat-item">
-              <div className="stat-value">{stats.imageCount}</div>
-              <div className="stat-label">图片</div>
-            </div>
-            <div className="stat-item">
-              <div className="stat-value">{Number(stats.totalAccessCount || 0).toLocaleString('zh-CN')}</div>
-              <div className="stat-label">访问</div>
-            </div>
-          </div>
+          )}
           <button
             className={`settings-gear ${adminMode ? 'active' : ''}`}
             onClick={() => setSettingsOpen(true)}
@@ -1001,25 +1602,142 @@ export default function App() {
         onRefreshLogs={fetchUploadLogs}
       />
 
-      <nav className="view-switch glass" aria-label="内容视图切换">
-        {[
-          { key: 'files', label: '☁️ 文件上传' },
-          { key: 'feed', label: `🎬 视频推荐 ${stats.feedVideoCount ? `(${stats.feedVideoCount})` : ''}` },
-          { key: 'notes', label: '📝 笔记' },
-        ].map(item => (
-          <button key={item.key} className={`view-tab ${activeView === item.key ? 'active' : ''}`} onClick={() => setActiveView(item.key)}>
-            {item.label}
+
+      <div className={`floating-upload-dock ${uploadPanelOpen ? 'expanded' : 'collapsed'} ${dragging ? 'dragging' : ''}`} onClick={(e) => e.stopPropagation()}>
+        <input
+          ref={fileInputRef}
+          type="file"
+          multiple
+          className="floating-file-input"
+          onChange={(e) => { handleUpload(e.target.files); e.target.value = ''; }}
+        />
+        {uploadPanelOpen ? (
+          <section className="floating-upload-panel glass" aria-label="上传文件面板">
+            <div className="floating-upload-header">
+              <div>
+                <div className="floating-upload-title">上传文件</div>
+                <div className="floating-upload-subtitle">{adminMode ? '管理员通道 · 最高 10GB' : '访客模式 · 公开上传'}</div>
+              </div>
+              <div className="floating-upload-window-actions">
+                <button className="floating-window-btn" onClick={() => setUploadPanelOpen(false)} aria-label="最小化上传面板">_</button>
+                <button className="floating-window-btn" onClick={() => setUploadPanelOpen(false)} aria-label="关闭上传面板">×</button>
+              </div>
+            </div>
+
+            <div
+              className={`floating-upload-drop ${dragging ? 'dragging' : ''}`}
+              onClick={() => fileInputRef.current?.click()}
+              onDragOver={(e) => { e.preventDefault(); e.stopPropagation(); setDragging(true); }}
+              onDragLeave={(e) => { e.stopPropagation(); setDragging(false); }}
+              onDrop={handleDrop}
+              role="button"
+              tabIndex={0}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' || e.key === ' ') {
+                  e.preventDefault();
+                  fileInputRef.current?.click();
+                }
+              }}
+              aria-label="拖拽文件到这里，或点击上传"
+            >
+              <div className="floating-upload-drop-icon" aria-hidden="true">{uploading ? '⏳' : '⬆'}</div>
+              <div className="floating-upload-drop-copy">
+                <strong>{uploading ? (uploadStatusText || '正在上传...') : '拖拽文件到这里'}</strong>
+                <span>或点击上传 / Ctrl+V 粘贴</span>
+              </div>
+            </div>
+
+            <div className="floating-upload-rules">
+              <span>原图原视频直传</span>
+              <span>单文件 {uploadLimitText}</span>
+              <span>8MB 分片</span>
+              <span>{expireAfterIdleDays} 天过期</span>
+            </div>
+
+            <div className="floating-upload-options">
+              <label
+                className="upload-feed-toggle floating-feed-toggle"
+                title={adminMode ? '管理员上传视频会直接推荐；非视频自动忽略。' : '访客上传视频需审核，通过后公开推荐。'}
+              >
+                <input
+                  type="checkbox"
+                  checked={uploadFeedRequested}
+                  onChange={e => setUploadFeedRequested(e.target.checked)}
+                />
+                <span className="switch-track" aria-hidden="true"><span className="switch-thumb" /></span>
+                <span className="upload-feed-text">
+                  <strong>{adminMode ? '加入推荐' : '申请推荐'}</strong>
+                  <small>{adminMode ? '视频直接推荐' : '访客需审核'}</small>
+                </span>
+              </label>
+              <span className="floating-format-hint" title="支持 PNG、JPG、GIF、WebP、SVG、MP4、MP3、PDF、ZIP、DOC 等格式">支持 PNG / JPG / MP4 / PDF 等格式</span>
+            </div>
+
+            {uploading && (
+              <div className="floating-upload-progress">
+                <div className="progress-header">
+                  <span className="progress-title">{uploadStatusText || '正在上传...'}</span>
+                  <span>{uploadProgress}%</span>
+                </div>
+                <div className="progress-bar-bg">
+                  <div className="progress-bar" style={{ width: `${uploadProgress}%` }} />
+                </div>
+              </div>
+            )}
+
+            {uploadError && !uploading && (
+              <div className="floating-upload-error" role="alert">
+                <div>
+                  <strong>{uploadError.message}</strong>
+                  <span>{uploadError.hint}</span>
+                  {uploadError.logId && <small>日志编号：{uploadError.logId}</small>}
+                </div>
+                <button className="btn btn-copy" onClick={() => setUploadError(null)}>知道了</button>
+              </div>
+            )}
+
+            <UploadResults
+              files={uploadResults}
+              onCopy={handleCopy}
+              onClear={() => setUploadResults([])}
+              onOpenSiteView={handleOpenSiteView}
+              onOpenDirectView={handleOpenDirectView}
+            />
+          </section>
+        ) : (
+          <button
+            className={`floating-upload-button glass ${uploading ? 'uploading' : ''} ${uploadResults.length && !uploading ? 'done' : ''}`}
+            onClick={() => setUploadPanelOpen(true)}
+            onDragOver={(e) => { e.preventDefault(); e.stopPropagation(); setDragging(true); }}
+            onDragLeave={(e) => { e.stopPropagation(); setDragging(false); }}
+            onDrop={handleDrop}
+            aria-label="打开上传文件浮窗"
+          >
+            <span className="floating-upload-icon" aria-hidden="true">⬆</span>
+            <span className="floating-upload-label">{uploading ? '上传中' : uploadResults.length ? '上传成功' : '上传文件'}</span>
+            <span className="floating-upload-status">{uploading ? `${uploadProgress}%` : uploadResults.length ? `${uploadResults.length} 个文件` : '点击 / 拖拽'}</span>
+            {uploading && <span className="floating-upload-mini-progress"><i style={{ width: `${uploadProgress}%` }} /></span>}
           </button>
-        ))}
-      </nav>
+        )}
+      </div>
 
       {activeView === 'feed' && (
         <FeedSection
           videos={feedVideos}
           loading={feedLoading}
+          adminMode={adminMode}
+          feedManageItems={feedManageItems}
+          feedManageSummary={feedManageSummary}
+          feedManageLoading={feedManageLoading}
+          feedManageStatus={feedManageStatus}
+          selectedFeedIds={selectedFeedIds}
           onRefresh={fetchFeedVideos}
           onOpenSiteView={handleOpenSiteView}
           onOpenDirectView={handleOpenDirectView}
+          onFetchFeedManage={fetchFeedManage}
+          onSetFeedManageStatus={setFeedManageStatus}
+          onToggleFeedSelect={handleToggleFeedSelect}
+          onFeedBatchAction={handleFeedBatchAction}
         />
       )}
 
@@ -1030,116 +1748,66 @@ export default function App() {
           adminMode={adminMode}
           noteDraft={noteDraft}
           setNoteDraft={setNoteDraft}
-          onCreateNote={handleCreateNote}
+          editingNoteId={editingNoteId}
+          noteHistories={noteHistories}
+          historyLoadingId={historyLoadingId}
+          onSaveNote={handleSaveNote}
+          onCancelEdit={resetNoteEditor}
+          onEditNote={handleEditNote}
+          onDeleteNote={handleDeleteNote}
+          onShowHistory={handleShowNoteHistory}
           onRefresh={fetchNotes}
         />
       )}
 
       {activeView === 'files' && (<>
 
-      {/* Upload Zone */}
-      <div
-        className={`upload-zone glass ${dragging ? 'dragging' : ''}`}
-        onClick={() => fileInputRef.current?.click()}
-        onDragOver={(e) => { e.preventDefault(); setDragging(true); }}
-        onDragLeave={() => setDragging(false)}
-        onDrop={handleDrop}
-      >
-        <div className="upload-icon">{uploading ? '⏳' : '☁️'}</div>
-        <div className="upload-title">
-          {uploading ? `${uploadStatusText || '上传中...'} ${uploadProgress}%` : '拖拽文件到此处、点击选择，或直接 Ctrl/⌘+V 粘贴上传'}
-        </div>
-        <div className="upload-subtitle">{adminMode ? '管理员 Token 已启用' : '访客默认'}：单文件最大 {formatSize(maxFileBytes)}；图片/视频/音频按原始文件上传不压缩；大文件自动分片断点续传；无访问 {expireAfterIdleDays} 天自动过期，访问或预览会把具体过期时间自动向后延期</div>
-        <label className="upload-feed-toggle" onClick={e => e.stopPropagation()}>
+      <div className="files-toolbar-panel glass">
+        <div className="toolbar compact-toolbar files-toolbar">
           <input
-            type="checkbox"
-            checked={uploadFeedRequested}
-            onChange={e => setUploadFeedRequested(e.target.checked)}
+            className="search-box"
+            placeholder="搜索文件名..."
+            onChange={(e) => handleSearch(e.target.value)}
           />
-          <span>允许本次上传的视频申请进入推荐区</span>
-          <small>{adminMode ? '管理员上传会直接推荐；非视频自动忽略。' : '访客上传会进入待审核；审核通过后才会公开推荐。'}</small>
-        </label>
-        <div className="upload-formats">
-          {['PNG', 'JPG', 'GIF', 'WebP', 'SVG', 'MP4', 'MP3', 'PDF', 'ZIP', 'DOC'].map(f => (
-            <span key={f} className="format-tag">{f}</span>
-          ))}
-        </div>
-        <input
-          ref={fileInputRef}
-          type="file"
-          multiple
-          style={{ display: 'none' }}
-          onChange={(e) => { handleUpload(e.target.files); e.target.value = ''; }}
-        />
-      </div>
-
-      {/* Upload Progress */}
-      {uploading && (
-        <div className="upload-progress glass">
-          <div className="progress-header">
-            <span className="progress-title">{uploadStatusText || '正在上传...'}</span>
-            <span style={{ color: 'var(--cyan)', fontSize: 14 }}>{uploadProgress}%</span>
+          <div className="filter-tabs">
+            {[
+              { key: '', label: '全部' },
+              { key: 'image', label: '图片' },
+              { key: 'video', label: '视频' },
+              { key: 'document', label: '文档' },
+              { key: 'other', label: '其他' },
+            ].map(tab => (
+              <button
+                key={tab.key}
+                className={`filter-tab ${filter === tab.key ? 'active' : ''}`}
+                onClick={() => { setFilter(tab.key); setPage(1); }}
+              >
+                {tab.label}
+              </button>
+            ))}
           </div>
-          <div className="progress-bar-bg">
-            <div className="progress-bar" style={{ width: `${uploadProgress}%` }} />
-          </div>
-        </div>
-      )}
-
-      {uploadError && !uploading && (
-        <div className="upload-error-card glass" role="alert">
-          <div className="upload-error-icon">⚠️</div>
-          <div className="upload-error-main">
-            <div className="upload-error-title">{uploadError.message}</div>
-            <div className="upload-error-hint">{uploadError.hint}</div>
-            <div className="upload-error-meta">
-              {uploadError.context?.fileName && <span>文件：{uploadError.context.fileName}</span>}
-              {uploadError.context?.phase && <span>阶段：{uploadError.context.phase}</span>}
-              {uploadError.logId && <span>日志编号：{uploadError.logId}</span>}
-            </div>
-          </div>
-          <button className="btn btn-copy" onClick={() => setUploadError(null)}>知道了</button>
-        </div>
-      )}
-
-      <UploadResults
-        files={uploadResults}
-        onCopy={handleCopy}
-        onClear={() => setUploadResults([])}
-        onOpenSiteView={handleOpenSiteView}
-        onOpenDirectView={handleOpenDirectView}
-      />
-
-      {/* Toolbar */}
-      <div className="toolbar">
-        <input
-          className="search-box"
-          placeholder="🔍 搜索文件名..."
-          onChange={(e) => handleSearch(e.target.value)}
-        />
-        <div className="filter-tabs">
-          {[
-            { key: '', label: '全部' },
-            { key: 'image', label: '🖼️ 图片' },
-            { key: 'video', label: '🎬 视频' },
-            { key: 'document', label: '📄 文档' },
-            { key: 'other', label: '📁 其他' },
-          ].map(tab => (
-            <button
-              key={tab.key}
-              className={`filter-tab ${filter === tab.key ? 'active' : ''}`}
-              onClick={() => { setFilter(tab.key); setPage(1); }}
+          <label className="sort-control">
+            <span>排序</span>
+            <select
+              className="sort-select"
+              value={sort}
+              onChange={(e) => { setSort(e.target.value); setPage(1); }}
+              aria-label="文件排序"
             >
-              {tab.label}
-            </button>
-          ))}
+              <option value="latest">最新上传</option>
+              <option value="access">访问最多</option>
+              <option value="expiring">即将到期</option>
+              <option value="largest">文件最大</option>
+              <option value="recommended">推荐优先</option>
+            </select>
+          </label>
         </div>
       </div>
 
       <div className="listing-header">
         <div>
           <div className="section-title">全部已上传</div>
-          <div className="section-subtitle">公开展示当前未过期文件，共 {pagination.total || files.length} 个；卡片展示访问量和具体过期时间，访问/预览会自动续期</div>
+          <div className="section-subtitle">共 {pagination.total || files.length} 个公开文件 · 仅展示未过期内容 · 访问后自动续期</div>
         </div>
       </div>
 
@@ -1162,8 +1830,20 @@ export default function App() {
             const isImage = previewKind === 'image' || isPreviewableImage(file);
             const isVideo = previewKind === 'video';
             const previewSource = buildPreviewUrl(file) || file.url;
-            const isCopied = copiedUrl === (file.shortUrl || file.url);
-            const openFile = () => handleOpenSiteView(file);
+            const copyTarget = file.shortUrl || file.url;
+            const isCopied = copiedUrl === copyTarget;
+            const fileKey = file.id || file.filename;
+            const displayName = file.title || file.originalName || file.filename || '未命名文件';
+            const showStatus = isVideo && (adminMode || (file.allowFeed && file.feedStatus === 'approved'));
+            const statusActive = file.allowFeed && file.feedStatus === 'approved';
+            const statusText = adminMode ? getFeedBadge(file) : '推荐中';
+            const moreProfile = getMorePanelProfile(file, previewKind);
+            const markdownTarget = file.markdown || (copyTarget ? (isImage ? `![${displayName}](${copyTarget})` : `[${displayName}](${copyTarget})`) : '');
+            const moreOpen = openMoreId === fileKey;
+            const openFile = () => {
+              setOpenMoreId('');
+              handleOpenSiteView(file);
+            };
             const handlePreviewKeyDown = (event) => {
               if (event.key === 'Enter' || event.key === ' ') {
                 event.preventDefault();
@@ -1171,73 +1851,99 @@ export default function App() {
               }
             };
             return (
-              <div key={file.filename} className="file-card glass glass-hover">
+              <div key={file.filename} className={`file-card glass glass-hover ${isVideo ? 'video-card' : ''}`}>
                 <div
                   className="file-preview preview-click-target"
                   onClick={openFile}
+                  onMouseEnter={isVideo ? handleVideoPreviewEnter : undefined}
+                  onMouseLeave={isVideo ? handleVideoPreviewLeave : undefined}
                   onKeyDown={handlePreviewKeyDown}
                   role="button"
                   tabIndex={0}
-                  title="点击在本站查看内容"
+                  title={isVideo ? '悬停自动预览，点击在本站查看视频' : '点击在本站查看内容'}
                 >
                   {isImage ? (
                     <img
                       src={previewSource}
-                      alt={file.originalName}
+                      alt={displayName}
                       loading="lazy"
                     />
                   ) : isVideo ? (
-                    <video src={previewSource} muted playsInline preload="metadata" />
+                    <video className="hover-preview-video" src={previewSource} muted playsInline loop preload="metadata" />
                   ) : (
                     <div className="file-type-icon">{getFileTypeIcon(file.mimeType)}</div>
                   )}
                   <span className="file-type-badge">
-                    {getFileExt(file.originalName) || 'FILE'}
+                    {getFileExt(file.originalName || file.filename) || 'FILE'}
                   </span>
+                  {isVideo ? <span className="video-play-badge" aria-hidden="true">▶</span> : null}
                 </div>
                 <div className="file-info">
-                  <div className="file-name" title={file.originalName}>{file.originalName}</div>
-                  <div className="file-meta">
-                    <span>{formatSize(file.size)}</span>
-                    <span>上传 {file.uploadDate || formatDate(file.uploadTime)}</span>
-                    <span>{accessCountText(file)}</span>
+                  <div className="file-title-row">
+                    <div className="file-name" title={displayName}>{displayName}</div>
+                    {showStatus ? <span className={`file-status-pill ${statusActive ? 'active' : ''}`}>{statusText}</span> : null}
                   </div>
-                  <FileLifecycleMeta file={file} compact />
-                  {isVideoFile(file) && <div className={`feed-status-pill ${file.allowFeed && file.feedStatus === 'approved' ? 'active' : ''}`}>🎬 {getFeedBadge(file)}</div>}
+                  <div className="file-compact-meta" aria-label="文件大小、访问次数和到期时间">
+                    <span>📦 {formatSize(file.size || 0)}</span>
+                    <span>👁 {Number(file.accessCount || 0).toLocaleString('zh-CN')}</span>
+                    <span>🕒 {formatCompactDateTime(file.expiresAt)} 到期</span>
+                  </div>
                 </div>
-                <div className="file-actions">
-                  <button
-                    className={`btn btn-copy ${isCopied ? 'copied' : ''}`}
-                    onClick={(e) => { e.stopPropagation(); handleCopy(file.shortUrl || file.url); }}
-                  >
-                    {isCopied ? '✓ 已复制' : '🔗 复制短链'}
-                  </button>
-                  <button
-                    className="btn btn-open"
-                    onClick={(e) => { e.stopPropagation(); handleOpenSiteView(file); }}
-                  >
-                    👁 本站查看
-                  </button>
-                  <button
-                    className="btn btn-open"
-                    onClick={(e) => { e.stopPropagation(); handleOpenDirectView(file); }}
-                  >
-                    ↗ 跳转
-                  </button>
-                  {isVideoFile(file) && (
+                <div className="file-actions-shell" onClick={(e) => e.stopPropagation()}>
+                  <div className="file-actions file-main-actions">
                     <button
-                      className="btn btn-copy"
-                      onClick={(e) => { e.stopPropagation(); handleToggleFeed(file, !(file.allowFeed && file.feedStatus === 'approved')); }}
+                      className="btn btn-open"
+                      onClick={openFile}
                     >
-                      {file.allowFeed && file.feedStatus === 'approved' ? '🙈 取消推荐' : '🎬 进推荐'}
+                      查看
                     </button>
-                  )}
-                  <button
-                    className="btn btn-delete"
-                    onClick={(e) => { e.stopPropagation(); handleDelete(file.id); }}
-                  >
-                    🗑
-                  </button>
+                    <button
+                      className={`btn btn-copy ${isCopied ? 'copied' : ''}`}
+                      onClick={() => { handleCopy(copyTarget); setOpenMoreId(''); }}
+                    >
+                      {isCopied ? '已复制' : '复制链接'}
+                    </button>
+                    <button
+                      className="btn btn-open"
+                      aria-expanded={moreOpen}
+                      onClick={() => setOpenMoreId(prev => (prev === fileKey ? '' : fileKey))}
+                    >
+                      更多
+                    </button>
+                  </div>
+                  {moreOpen ? (
+                    <div className={`file-more-panel more-${moreProfile.className}`} role="dialog" aria-label={`${displayName} 更多视角和操作`}>
+                      <div className="file-more-card">
+                        <div className="file-more-head">
+                          <span className="file-more-icon" aria-hidden="true">{moreProfile.icon}</span>
+                          <div className="file-more-heading">
+                            <div className="file-more-kicker">{moreProfile.eyebrow}</div>
+                            <div className="file-more-title">{moreProfile.title}</div>
+                          </div>
+                          <button className="file-more-close" onClick={() => setOpenMoreId('')} aria-label="关闭更多浮窗">×</button>
+                        </div>
+                        <p className="file-more-desc">{moreProfile.description}</p>
+                        <div className="file-more-metrics" aria-label="当前文件概览">
+                          <span>{moreProfile.accent}</span>
+                          <span>{formatSize(file.size || 0)}</span>
+                          <span>{Number(file.accessCount || 0).toLocaleString('zh-CN')} 次</span>
+                        </div>
+                      </div>
+                      <div className="file-more-actions">
+                        <button className="more-panel-action" onClick={openFile}>{moreProfile.previewAction}</button>
+                        <button className="more-panel-action" onClick={() => { setOpenMoreId(''); handleOpenDirectView(file); }}>打开原文件</button>
+                        <button className="more-panel-action" onClick={() => { handleCopy(file.url || file.directUrl || copyTarget); setOpenMoreId(''); }}>复制直链</button>
+                        {markdownTarget ? <button className="more-panel-action" onClick={() => { handleCopy(markdownTarget); setOpenMoreId(''); }}>复制 Markdown</button> : null}
+                        {adminMode && isVideo ? <button className="more-panel-action" onClick={() => handleOpenEditFile(file)}>编辑信息</button> : null}
+                        {adminMode && isVideo ? (
+                          <button className="more-panel-action" onClick={() => handleToggleFeed(file, !statusActive)}>
+                            {statusActive ? '取消推荐' : '设为推荐'}
+                          </button>
+                        ) : null}
+                        {adminMode ? <button className="more-panel-action danger" onClick={() => handleDelete(file.id, displayName)}>删除文件</button> : null}
+                      </div>
+                    </div>
+                  ) : null}
                 </div>
               </div>
             );
@@ -1293,6 +1999,14 @@ export default function App() {
         onCopy={handleCopy}
         onDelete={handleDelete}
         onOpenExternal={handleOpenDirectView}
+        adminMode={adminMode}
+      />
+
+      <FileEditModal
+        file={editingFile}
+        saving={editSaving}
+        onClose={() => setEditingFile(null)}
+        onSave={handleSaveFileInfo}
       />
 
     </div>

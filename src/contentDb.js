@@ -5,6 +5,8 @@ import { DatabaseSync } from 'node:sqlite';
 
 const VALID_VISIBILITY = new Set(['private', 'unlisted', 'public']);
 const VALID_FEED_STATUS = new Set(['hidden', 'pending', 'approved', 'rejected']);
+const VALID_FEED_MANAGEMENT_STATUS = new Set(['all', 'hidden', 'pending', 'approved', 'rejected']);
+const VALID_FEED_BATCH_ACTION = new Set(['approve', 'hide', 'reject', 'clear-approved']);
 const VALID_NOTE_VISIBILITY = new Set(['private', 'public']);
 
 function nowIso() {
@@ -32,6 +34,31 @@ function normalizeFeedStatus(value, fallback = 'hidden') {
 function normalizeNoteVisibility(value, fallback = 'private') {
   const normalized = String(value || '').toLowerCase();
   return VALID_NOTE_VISIBILITY.has(normalized) ? normalized : fallback;
+}
+
+function normalizeFeedManagementStatus(value) {
+  const normalized = String(value || 'all').trim().toLowerCase();
+  return VALID_FEED_MANAGEMENT_STATUS.has(normalized) ? normalized : 'all';
+}
+
+function normalizeFeedBatchAction(value) {
+  const normalized = String(value || '').trim().replace(/_/g, '-').toLowerCase();
+  const aliases = {
+    clearapproved: 'clear-approved',
+    'clear-all': 'clear-approved',
+    'cancel-all': 'clear-approved',
+    'cancel-approved': 'clear-approved',
+    cancel: 'hide',
+    remove: 'hide',
+    disable: 'hide',
+  };
+  const action = aliases[normalized] || normalized;
+  return VALID_FEED_BATCH_ACTION.has(action) ? action : '';
+}
+
+function normalizeIdList(ids = []) {
+  const input = Array.isArray(ids) ? ids : [ids];
+  return [...new Set(input.map(id => String(id || '').trim()).filter(Boolean))].slice(0, 500);
 }
 
 function mediaTypeFromMime(mimeType = '') {
@@ -174,6 +201,27 @@ function rowToNote(row) {
   };
 }
 
+function rowToNoteRevision(row) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    noteId: row.note_id,
+    revision: Number(row.revision || 0),
+    action: row.action || 'updated',
+    fileId: row.file_id || '',
+    title: row.title || '',
+    content: row.content || '',
+    contentFormat: row.content_format || 'markdown',
+    visibility: row.visibility || 'private',
+    pinned: fromBoolInt(row.pinned),
+    tags: parseJsonArray(row.tags_json),
+    createdAt: row.created_at,
+    noteCreatedAt: row.note_created_at || '',
+    noteUpdatedAt: row.note_updated_at || '',
+    deletedAt: row.deleted_at || '',
+  };
+}
+
 function ensureParentDir(filename) {
   if (!filename || filename === ':memory:') return;
   fs.mkdirSync(path.dirname(filename), { recursive: true });
@@ -222,6 +270,8 @@ export function createContentDb({ filename = ':memory:' } = {}) {
     CREATE INDEX IF NOT EXISTS idx_files_upload_time ON files(upload_time DESC);
     CREATE INDEX IF NOT EXISTS idx_files_media_feed ON files(media_type, allow_feed, feed_status, status, upload_time DESC);
     CREATE INDEX IF NOT EXISTS idx_files_visibility ON files(visibility, status);
+    CREATE INDEX IF NOT EXISTS idx_files_stored_name ON files(stored_name);
+    CREATE INDEX IF NOT EXISTS idx_files_admin_feed ON files(status, media_type, feed_status, allow_feed, visibility, upload_time DESC);
 
     CREATE TABLE IF NOT EXISTS notes (
       id TEXT PRIMARY KEY,
@@ -238,6 +288,26 @@ export function createContentDb({ filename = ':memory:' } = {}) {
       FOREIGN KEY(file_id) REFERENCES files(id) ON DELETE SET NULL
     );
     CREATE INDEX IF NOT EXISTS idx_notes_file ON notes(file_id, visibility, created_at DESC);
+
+    CREATE TABLE IF NOT EXISTS note_revisions (
+      id TEXT PRIMARY KEY,
+      note_id TEXT NOT NULL,
+      revision INTEGER NOT NULL,
+      action TEXT DEFAULT 'updated',
+      file_id TEXT DEFAULT NULL,
+      title TEXT DEFAULT '',
+      content TEXT DEFAULT '',
+      content_format TEXT DEFAULT 'markdown',
+      visibility TEXT DEFAULT 'private',
+      pinned INTEGER DEFAULT 0,
+      tags_json TEXT DEFAULT '[]',
+      note_created_at TEXT DEFAULT '',
+      note_updated_at TEXT DEFAULT '',
+      deleted_at TEXT DEFAULT '',
+      created_at TEXT DEFAULT '',
+      UNIQUE(note_id, revision)
+    );
+    CREATE INDEX IF NOT EXISTS idx_note_revisions_note ON note_revisions(note_id, revision ASC);
   `);
 
   const upsertStmt = sqlite.prepare(`
@@ -331,18 +401,23 @@ export function createContentDb({ filename = ':memory:' } = {}) {
     return getFileById(normalized.id);
   }
 
-  function importFileIndex(fileIndex = {}) {
+  function importFileIndex(fileIndex = {}, { overwriteExisting = false } = {}) {
     let inserted = 0;
     let updated = 0;
-    const tx = sqlite.prepare('SELECT COUNT(*) AS count FROM files WHERE id = ?');
+    let skippedExisting = 0;
+    const existsStmt = sqlite.prepare('SELECT COUNT(*) AS count FROM files WHERE id = ?');
     for (const [key, record] of Object.entries(fileIndex || {})) {
       const normalized = normalizeRecord({ filename: key, ...record });
-      const exists = Number(tx.get(normalized.id)?.count || 0) > 0;
+      const exists = Number(existsStmt.get(normalized.id)?.count || 0) > 0;
+      if (exists && !overwriteExisting) {
+        skippedExisting += 1;
+        continue;
+      }
       upsertFile(normalized);
       if (exists) updated += 1;
       else inserted += 1;
     }
-    return { inserted, updated };
+    return { inserted, updated, skippedExisting };
   }
 
   function getFileById(id) {
@@ -350,7 +425,7 @@ export function createContentDb({ filename = ':memory:' } = {}) {
     return rowToFile(row);
   }
 
-  function listFiles({ page = 1, limit = 50, search = '', type = '', includeDeleted = false } = {}) {
+  function listFiles({ page = 1, limit = 50, search = '', type = '', sort = 'latest', includeDeleted = false } = {}) {
     const conditions = [];
     const params = [];
     if (!includeDeleted) conditions.push("status = 'active'");
@@ -371,7 +446,15 @@ export function createContentDb({ filename = ':memory:' } = {}) {
     const safePage = Math.max(Number(page) || 1, 1);
     const offset = (safePage - 1) * safeLimit;
     const total = Number(sqlite.prepare(`SELECT COUNT(*) AS total FROM files ${where}`).get(...params).total || 0);
-    const rows = sqlite.prepare(`SELECT * FROM files ${where} ORDER BY upload_time DESC LIMIT ? OFFSET ?`).all(...params, safeLimit, offset);
+    const sortOrders = {
+      latest: 'upload_time DESC',
+      access: 'access_count DESC, upload_time DESC',
+      expiring: "CASE WHEN expires_at IS NULL OR expires_at = '' THEN 1 ELSE 0 END ASC, expires_at ASC, upload_time DESC",
+      largest: 'size DESC, upload_time DESC',
+      recommended: "CASE WHEN allow_feed = 1 AND feed_status = 'approved' AND visibility = 'public' THEN 0 WHEN allow_feed = 1 THEN 1 ELSE 2 END ASC, upload_time DESC",
+    };
+    const orderBy = sortOrders[String(sort || 'latest')] || sortOrders.latest;
+    const rows = sqlite.prepare(`SELECT * FROM files ${where} ORDER BY ${orderBy} LIMIT ? OFFSET ?`).all(...params, safeLimit, offset);
     return {
       files: rows.map(rowToFile),
       pagination: { page: safePage, limit: safeLimit, total, totalPages: Math.max(Math.ceil(total / safeLimit), 1) },
@@ -444,6 +527,132 @@ export function createContentDb({ filename = ':memory:' } = {}) {
     return { videos, nextCursor };
   }
 
+  function appendFeedManagementStatusCondition(conditions, params, feedStatus) {
+    if (feedStatus === 'approved') conditions.push("allow_feed = 1 AND feed_status = 'approved' AND visibility = 'public'");
+    else if (feedStatus === 'pending') conditions.push("allow_feed = 1 AND feed_status = 'pending'");
+    else if (feedStatus === 'rejected') conditions.push("feed_status = 'rejected'");
+    else if (feedStatus === 'hidden') conditions.push("(allow_feed = 0 OR feed_status = 'hidden')");
+  }
+
+  function buildFeedManagementBase({ search = '' } = {}) {
+    const conditions = ["status = 'active'", "media_type = 'video'"];
+    const params = [];
+    if (search) {
+      conditions.push('(LOWER(original_name) LIKE ? OR LOWER(id) LIKE ? OR LOWER(filename) LIKE ? OR LOWER(title) LIKE ?)');
+      const like = `%${String(search).toLowerCase()}%`;
+      params.push(like, like, like, like);
+    }
+    return { conditions, params };
+  }
+
+  function listFeedManagementVideos({ page = 1, limit = 80, feedStatus = 'all', search = '' } = {}) {
+    const safeLimit = Math.min(Math.max(Number(limit) || 80, 1), 200);
+    const safePage = Math.max(Number(page) || 1, 1);
+    const offset = (safePage - 1) * safeLimit;
+    const normalizedStatus = normalizeFeedManagementStatus(feedStatus);
+    const base = buildFeedManagementBase({ search });
+    const summaryWhere = `WHERE ${base.conditions.join(' AND ')}`;
+    const summaryRow = sqlite.prepare(`
+      SELECT
+        COUNT(*) AS totalVideos,
+        SUM(CASE WHEN allow_feed = 1 AND feed_status = 'approved' AND visibility = 'public' THEN 1 ELSE 0 END) AS approved,
+        SUM(CASE WHEN allow_feed = 1 AND feed_status = 'pending' THEN 1 ELSE 0 END) AS pending,
+        SUM(CASE WHEN feed_status = 'rejected' THEN 1 ELSE 0 END) AS rejected,
+        SUM(CASE WHEN allow_feed = 0 OR feed_status = 'hidden' THEN 1 ELSE 0 END) AS hidden
+      FROM files ${summaryWhere}
+    `).get(...base.params);
+
+    const listConditions = [...base.conditions];
+    const listParams = [...base.params];
+    appendFeedManagementStatusCondition(listConditions, listParams, normalizedStatus);
+    const where = `WHERE ${listConditions.join(' AND ')}`;
+    const total = Number(sqlite.prepare(`SELECT COUNT(*) AS total FROM files ${where}`).get(...listParams).total || 0);
+    const rows = sqlite.prepare(`SELECT * FROM files ${where} ORDER BY upload_time DESC LIMIT ? OFFSET ?`).all(...listParams, safeLimit, offset);
+
+    return {
+      files: rows.map(rowToFile),
+      pagination: { page: safePage, limit: safeLimit, total, totalPages: Math.max(Math.ceil(total / safeLimit), 1) },
+      summary: {
+        totalVideos: Number(summaryRow.totalVideos || 0),
+        approved: Number(summaryRow.approved || 0),
+        pending: Number(summaryRow.pending || 0),
+        rejected: Number(summaryRow.rejected || 0),
+        hidden: Number(summaryRow.hidden || 0),
+      },
+    };
+  }
+
+  function bulkUpdateFeed({ action = '', ids = [] } = {}) {
+    const normalizedAction = normalizeFeedBatchAction(action);
+    if (!normalizedAction) throw new Error('Invalid feed batch action');
+    const now = nowIso();
+    let sql = '';
+    let params = [];
+
+    if (normalizedAction === 'clear-approved') {
+      sql = `
+        UPDATE files
+        SET visibility = 'unlisted', allow_feed = 0, feed_status = 'hidden', updated_at = ?
+        WHERE status = 'active'
+          AND media_type = 'video'
+          AND allow_feed = 1
+          AND feed_status = 'approved'
+      `;
+      params = [now];
+    } else {
+      const normalizedIds = normalizeIdList(ids);
+      if (normalizedIds.length === 0) return { action: normalizedAction, matched: 0, updated: 0 };
+      const placeholders = normalizedIds.map(() => '?').join(', ');
+      const sets = {
+        approve: "visibility = 'public', allow_feed = 1, feed_status = 'approved'",
+        hide: "visibility = 'unlisted', allow_feed = 0, feed_status = 'hidden'",
+        reject: "visibility = 'unlisted', allow_feed = 1, feed_status = 'rejected'",
+      };
+      sql = `
+        UPDATE files
+        SET ${sets[normalizedAction]}, updated_at = ?
+        WHERE status = 'active'
+          AND media_type = 'video'
+          AND id IN (${placeholders})
+      `;
+      params = [now, ...normalizedIds];
+    }
+
+    const result = sqlite.prepare(sql).run(...params);
+    return { action: normalizedAction, matched: Number(result.changes || 0), updated: Number(result.changes || 0) };
+  }
+
+  function appendNoteRevision(note, action = 'updated') {
+    if (!note?.id) return null;
+    const row = sqlite.prepare('SELECT COALESCE(MAX(revision), 0) + 1 AS revision FROM note_revisions WHERE note_id = ?').get(note.id);
+    const revision = Number(row?.revision || 1);
+    const id = crypto.randomUUID().replace(/-/g, '').slice(0, 16);
+    const iso = nowIso();
+    sqlite.prepare(`
+      INSERT INTO note_revisions (
+        id, note_id, revision, action, file_id, title, content, content_format,
+        visibility, pinned, tags_json, note_created_at, note_updated_at, deleted_at, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      id,
+      note.id,
+      revision,
+      String(action || 'updated'),
+      note.fileId ? String(note.fileId) : null,
+      String(note.title || '').slice(0, 180),
+      String(note.content || '').slice(0, 20000),
+      String(note.contentFormat || 'markdown'),
+      normalizeNoteVisibility(note.visibility),
+      boolInt(note.pinned),
+      stringifyTags(note.tags),
+      note.createdAt || '',
+      note.updatedAt || '',
+      note.deletedAt || '',
+      iso
+    );
+    return rowToNoteRevision(sqlite.prepare('SELECT * FROM note_revisions WHERE id = ?').get(id));
+  }
+
   function createNote({ fileId = '', title = '', content = '', contentFormat = 'markdown', visibility = 'private', pinned = false, tags = [] } = {}) {
     const id = crypto.randomUUID().replace(/-/g, '').slice(0, 16);
     const iso = nowIso();
@@ -462,7 +671,9 @@ export function createContentDb({ filename = ':memory:' } = {}) {
       iso,
       iso
     );
-    return getNote(id);
+    const note = getNote(id);
+    appendNoteRevision(note, 'created');
+    return note;
   }
 
   function getNote(id) {
@@ -482,9 +693,54 @@ export function createContentDb({ filename = ':memory:' } = {}) {
     return { notes: rows.map(rowToNote) };
   }
 
+  function updateNote(id, patch = {}) {
+    const existing = getNote(id);
+    if (!existing) return null;
+    const updatedAt = nowIso();
+    const next = {
+      ...existing,
+      title: patch.title === undefined ? existing.title : String(patch.title || '').slice(0, 180),
+      content: patch.content === undefined ? existing.content : String(patch.content || '').slice(0, 20000),
+      contentFormat: patch.contentFormat === undefined ? existing.contentFormat : String(patch.contentFormat || 'markdown'),
+      visibility: patch.visibility === undefined ? existing.visibility : normalizeNoteVisibility(patch.visibility),
+      pinned: patch.pinned === undefined ? existing.pinned : Boolean(patch.pinned),
+      tags: patch.tags === undefined ? existing.tags : (Array.isArray(patch.tags) ? patch.tags : String(patch.tags || '').split(',')),
+      updatedAt,
+    };
+    sqlite.prepare(`
+      UPDATE notes
+      SET title = ?, content = ?, content_format = ?, visibility = ?, pinned = ?, tags_json = ?, updated_at = ?
+      WHERE id = ? AND deleted_at = ''
+    `).run(
+      next.title,
+      next.content,
+      next.contentFormat,
+      next.visibility,
+      boolInt(next.pinned),
+      stringifyTags(next.tags),
+      updatedAt,
+      existing.id
+    );
+    const updated = getNote(existing.id);
+    appendNoteRevision(updated, 'updated');
+    return updated;
+  }
+
+  function listNoteHistory(id, { includeDeleted = false } = {}) {
+    const rows = sqlite.prepare('SELECT * FROM note_revisions WHERE note_id = ? ORDER BY revision ASC').all(id);
+    const history = rows.map(rowToNoteRevision).filter(Boolean);
+    if (!includeDeleted) return { history: history.filter(item => item.action !== 'deleted') };
+    return { history };
+  }
+
   function deleteNote(id) {
-    const result = sqlite.prepare('UPDATE notes SET deleted_at = ?, updated_at = ? WHERE id = ? AND deleted_at = ?').run(nowIso(), nowIso(), id, '');
-    return Number(result.changes || 0) > 0;
+    const existing = getNote(id);
+    if (!existing) return false;
+    const deletedAt = nowIso();
+    const result = sqlite.prepare('UPDATE notes SET deleted_at = ?, updated_at = ? WHERE id = ? AND deleted_at = ?').run(deletedAt, deletedAt, id, '');
+    const deleted = Number(result.changes || 0) > 0;
+    if (deleted) appendNoteRevision({ ...existing, updatedAt: deletedAt, deletedAt }, 'deleted');
+    return deleted;
   }
 
   function stats() {
@@ -496,7 +752,7 @@ export function createContentDb({ filename = ':memory:' } = {}) {
         SUM(CASE WHEN media_type = 'image' THEN 1 ELSE 0 END) AS imageCount,
         SUM(CASE WHEN media_type = 'video' THEN 1 ELSE 0 END) AS videoCount,
         SUM(CASE WHEN media_type = 'audio' THEN 1 ELSE 0 END) AS audioCount,
-        SUM(CASE WHEN allow_feed = 1 AND feed_status = 'approved' AND media_type = 'video' THEN 1 ELSE 0 END) AS feedVideoCount
+        SUM(CASE WHEN allow_feed = 1 AND feed_status = 'approved' AND visibility = 'public' AND media_type = 'video' THEN 1 ELSE 0 END) AS feedVideoCount
       FROM files
       WHERE status = 'active'
     `).get();
@@ -528,9 +784,13 @@ export function createContentDb({ filename = ':memory:' } = {}) {
     deleteFile,
     hardDeleteFile,
     listFeedVideos,
+    listFeedManagementVideos,
+    bulkUpdateFeed,
     createNote,
     getNote,
     listNotes,
+    updateNote,
+    listNoteHistory,
     deleteNote,
     stats,
     close: () => sqlite.close(),

@@ -39,3 +39,12 @@ export function normalizeNoteDraft({ title = '', content = '', tagsText = '', pu
 export function buildUploadFeedPreference(enabled = false) {
   return enabled ? 'request' : '';
 }
+
+export function buildFeedBatchPayload(action = '', ids = []) {
+  const normalizedAction = String(action || '').trim().replace(/_/g, '-').toLowerCase();
+  if (normalizedAction === 'clear-approved') return { action: 'clear-approved' };
+  const normalizedIds = [...new Set((Array.isArray(ids) ? ids : [ids])
+    .map(id => String(id || '').trim())
+    .filter(Boolean))];
+  return { action: normalizedAction, ids: normalizedIds };
+}

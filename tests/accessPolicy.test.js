@@ -19,6 +19,8 @@ test('mutating file management routes still require admin access', () => {
   assert.equal(routeRequiresAdmin('DELETE', '/api/notes/note123'), true);
   assert.equal(routeRequiresAdmin('POST', '/api/upload'), false);
   assert.equal(routeRequiresAdmin('GET', '/api/feed/videos'), false);
+  assert.equal(routeRequiresAdmin('GET', '/api/admin/feed/videos'), true);
+  assert.equal(routeRequiresAdmin('POST', '/api/admin/feed/batch'), true);
 });
 
 test('public file records do not expose uploader IP addresses but keep lifecycle counters', () => {

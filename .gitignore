@@ -7,3 +7,10 @@ logs/
 data/
 file-index.json
 file-index.json.bak*
+.venv-media-moderation/
+backups/
+.tmp-e2e/
+playwright-report/
+test-results/
+tmp/
+*.log
